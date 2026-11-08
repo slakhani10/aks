@@ -28,21 +28,22 @@ on:
         default: 2
         type: number
       action:
-        description: "what-if = preview only, deploy = apply changes"
+        description: "plan = preview only, apply = apply the reviewed plan, destroy = plan + apply a destroy"
         required: true
-        default: "what-if"
+        default: "plan"
         type: choice
         options:
-          - what-if
-          - deploy
+          - plan
+          - apply
+          - destroy
       deploy_sample_app:
-        description: "Deploy the smoke-test app behind the App Gateway after deployment"
+        description: "Deploy the smoke-test app behind the App Gateway after apply"
         required: false
         default: false
         type: boolean
   pull_request:
     paths:
-      - "infra/**"
+      - "terraform/**"
       - "k8s/**"
       - ".github/workflows/deploy-aks.yml"
 
@@ -51,46 +52,68 @@ permissions:
   id-token: write # OIDC federation to Entra ID - no client secrets stored in GitHub
 
 concurrency:
+  # One run per resource group at a time (Terraform state is also locked via blob lease).
   group: aks-${{ inputs.resource_group || github.ref }}
   cancel-in-progress: false
 
 env:
-  TEMPLATE_FILE: infra/main.bicep
+  TF_VERSION: "1.13.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  WORKDIR: terraform
+  # azurerm provider + backend authentication via GitHub OIDC
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
 jobs:
   # ---------------------------------------------------------------------------
   lint:
-    name: Lint & build Bicep
+    name: fmt & validate
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Bicep
-        run: az bicep install && az bicep version
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Build
-        run: az bicep build --file "$TEMPLATE_FILE" --stdout > /dev/null
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
 
-      - name: Lint
-        run: az bicep lint --file "$TEMPLATE_FILE"
+      - name: terraform validate
+        run: |
+          terraform init -backend=false
+          terraform validate
 
   # ---------------------------------------------------------------------------
-  preview:
-    name: Validate & what-if
+  plan:
+    name: Plan
     if: github.event_name == 'workflow_dispatch'
     needs: lint
     runs-on: ubuntu-latest
     environment: azure-preview
-    outputs:
-      params: ${{ steps.params.outputs.params }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
     env:
       RG: ${{ inputs.resource_group }}
-      SYSTEM_VM: ${{ inputs.system_node_vm_size }}
-      SYSTEM_COUNT: ${{ inputs.system_node_count }}
-      USER_VM: ${{ inputs.user_node_vm_size }}
-      USER_COUNT: ${{ inputs.user_node_count }}
+      TF_VAR_resource_group_name: ${{ inputs.resource_group }}
+      TF_VAR_system_node_vm_size: ${{ inputs.system_node_vm_size }}
+      TF_VAR_system_node_count: ${{ inputs.system_node_count }}
+      TF_VAR_user_node_vm_size: ${{ inputs.user_node_vm_size }}
+      TF_VAR_user_node_count: ${{ inputs.user_node_count }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -107,82 +130,69 @@ jobs:
           fi
           echo "Region: $(az group show -n "$RG" --query location -o tsv)"
 
-      - name: Build parameters
-        id: params
+      - name: Check encryption-at-host feature
         run: |
-          set -euo pipefail
-
-          # Object ID of the pipeline identity (from the ARM token) so it can run
-          # 'az aks command invoke' against the private cluster with Azure RBAC.
-          DEPLOYER_OID=$(az account get-access-token --query accessToken -o tsv | python3 -c '
-          import sys, json, base64
-          p = sys.stdin.read().strip().split(".")[1]
-          p += "=" * (-len(p) % 4)
-          print(json.loads(base64.urlsafe_b64decode(p))["oid"])')
-
           # Encryption at host requires a subscription feature flag.
-          FEATURE_STATE=$(az feature show --namespace Microsoft.Compute --name EncryptionAtHost \
-                            --query properties.state -o tsv 2>/dev/null || echo "Unknown")
-          ENC_AT_HOST=true
-          case "$FEATURE_STATE" in
-            Registered) ;;
-            Unknown) echo "::notice::Cannot read EncryptionAtHost feature state (insufficient permissions?). Assuming it is registered." ;;
-            *) ENC_AT_HOST=false
-               echo "::warning::Microsoft.Compute/EncryptionAtHost is '$FEATURE_STATE'. Deploying WITHOUT encryption at host. Run 'az feature register --namespace Microsoft.Compute --name EncryptionAtHost' and redeploy." ;;
+          STATE=$(az feature show --namespace Microsoft.Compute --name EncryptionAtHost \
+                    --query properties.state -o tsv 2>/dev/null || echo "Unknown")
+          case "$STATE" in
+            Registered) echo "TF_VAR_enable_encryption_at_host=true" >> "$GITHUB_ENV" ;;
+            Unknown)    echo "::notice::Cannot read EncryptionAtHost feature state (insufficient permissions?). Assuming it is registered."
+                        echo "TF_VAR_enable_encryption_at_host=true" >> "$GITHUB_ENV" ;;
+            *)          echo "::warning::Microsoft.Compute/EncryptionAtHost is '$STATE'. Deploying WITHOUT encryption at host. Run 'az feature register --namespace Microsoft.Compute --name EncryptionAtHost' and re-run."
+                        echo "TF_VAR_enable_encryption_at_host=false" >> "$GITHUB_ENV" ;;
           esac
 
-          PARAMS="systemNodeVmSize=$SYSTEM_VM systemNodeCount=$SYSTEM_COUNT userNodeCount=$USER_COUNT deployerPrincipalId=$DEPLOYER_OID enableEncryptionAtHost=$ENC_AT_HOST"
-          if [ -n "$USER_VM" ]; then
-            PARAMS="$PARAMS userNodeVmSize=$USER_VM"
-          fi
-
-          # Reject anything that is not a plain key=value token (inputs are user supplied).
-          for p in $PARAMS; do
-            [[ "$p" =~ ^[A-Za-z]+=[A-Za-z0-9_.-]+$ ]] || { echo "::error::Invalid parameter value: $p"; exit 1; }
-          done
-          echo "params=$PARAMS" >> "$GITHUB_OUTPUT"
-
-      - name: Validate
-        env:
-          PARAMS: ${{ steps.params.outputs.params }}
+      - name: terraform init
         run: |
-          # shellcheck disable=SC2086
-          az deployment group validate \
-            --resource-group "$RG" \
-            --template-file "$TEMPLATE_FILE" \
-            --parameters $PARAMS \
-            --output none
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RG}.tfstate"
 
-      - name: What-if
-        env:
-          PARAMS: ${{ steps.params.outputs.params }}
+      - name: terraform plan
         run: |
-          # shellcheck disable=SC2086
-          az deployment group what-if \
-            --resource-group "$RG" \
-            --template-file "$TEMPLATE_FILE" \
-            --parameters $PARAMS \
-            --result-format FullResourcePayloads | tee whatif.txt
+          DESTROY_FLAG=""
+          if [ "${{ inputs.action }}" = "destroy" ]; then DESTROY_FLAG="-destroy"; fi
+          terraform plan $DESTROY_FLAG -out=tfplan -no-color | tee plan.txt
           {
-            echo "## What-if for \`$RG\`"
+            echo "## Terraform plan (${{ inputs.action }}) for \`$RG\`"
             echo '```'
-            tail -n 60 whatif.txt
+            grep -E '^(Plan:|No changes|  # )' plan.txt | tail -n 80
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The reviewed plan is applied as-is by the next job. It contains resource
+      # attributes (no secrets are generated by this configuration); keep retention short.
+      - name: Upload plan
+        if: inputs.action != 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ env.WORKDIR }}/tfplan
+          retention-days: 1
+
   # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'deploy'
-    needs: preview
+  apply:
+    name: Apply
+    if: github.event_name == 'workflow_dispatch' && inputs.action != 'plan'
+    needs: plan
     runs-on: ubuntu-latest
-    # Configure required reviewers on this environment to gate production changes.
+    # Configure required reviewers on this environment to gate changes.
     environment: azure-production
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
     env:
       RG: ${{ inputs.resource_group }}
-      PARAMS: ${{ needs.preview.outputs.params }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -191,22 +201,31 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy Bicep
-        id: deploy
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC2086
-          az deployment group create \
-            --resource-group "$RG" \
-            --name "secure-aks-${GITHUB_RUN_ID}" \
-            --template-file "$TEMPLATE_FILE" \
-            --parameters $PARAMS \
-            --query properties.outputs -o json > outputs.json
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ env.WORKDIR }}
 
-          for key in aksName appGatewayName appGatewayPublicIp appGatewayFqdn ingressPrivateIp ingressSubnetName keyVaultName natGatewayPublicIp; do
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RG}.tfstate"
+
+      - name: terraform apply
+        run: terraform apply -no-color tfplan
+
+      - name: Outputs
+        id: out
+        if: inputs.action == 'apply'
+        run: |
+          terraform output -json > outputs.json
+          for key in aks_name app_gateway_name app_gateway_public_ip ingress_private_ip ingress_subnet_name; do
             echo "$key=$(jq -r ".${key}.value" outputs.json)" >> "$GITHUB_OUTPUT"
           done
-
           {
             echo "## Deployed \`$RG\`"
             echo "| Output | Value |"
@@ -215,11 +234,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy smoke-test app (via az aks command invoke)
-        if: inputs.deploy_sample_app
+        if: inputs.action == 'apply' && inputs.deploy_sample_app
+        working-directory: .
         env:
-          AKS_NAME: ${{ steps.deploy.outputs.aksName }}
-          INGRESS_IP: ${{ steps.deploy.outputs.ingressPrivateIp }}
-          INGRESS_SUBNET: ${{ steps.deploy.outputs.ingressSubnetName }}
+          AKS_NAME: ${{ steps.out.outputs.aks_name }}
+          INGRESS_IP: ${{ steps.out.outputs.ingress_private_ip }}
+          INGRESS_SUBNET: ${{ steps.out.outputs.ingress_subnet_name }}
         run: |
           set -euo pipefail
           mkdir -p invoke
@@ -241,10 +261,10 @@ jobs:
           exit 1
 
       - name: Verify traffic flows through the App Gateway WAF
-        if: inputs.deploy_sample_app
+        if: inputs.action == 'apply' && inputs.deploy_sample_app
         env:
-          AGW_NAME: ${{ steps.deploy.outputs.appGatewayName }}
-          AGW_IP: ${{ steps.deploy.outputs.appGatewayPublicIp }}
+          AGW_NAME: ${{ steps.out.outputs.app_gateway_name }}
+          AGW_IP: ${{ steps.out.outputs.app_gateway_public_ip }}
         run: |
           for attempt in $(seq 1 20); do
             health=$(az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" \

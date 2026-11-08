@@ -1,6 +1,6 @@
 # Secure AKS environment (CIS Microsoft Azure Foundations Benchmark v1.4)
 
-This repo holds Bicep templates and a GitHub Actions workflow. They deploy a private Azure Kubernetes Service (AKS) cluster into an **existing** resource group. The cluster is reachable from the Internet **only** through an Application Gateway with WAF.
+This repo holds Terraform (azurerm provider 4.x) and a GitHub Actions workflow. They deploy a private Azure Kubernetes Service (AKS) cluster into an **existing** resource group. The cluster is reachable from the Internet **only** through an Application Gateway with WAF.
 
 ```
                      Internet
@@ -31,7 +31,7 @@ This repo holds Bicep templates and a GitHub Actions workflow. They deploy a pri
 | `user_node_vm_size` | no | same as system | Workload pool SKU |
 | `user_node_count` | yes | `2` | Workload pool node count (0–1000) |
 
-Everything else has a secure default in [`infra/main.bicep`](infra/main.bicep). That includes address spaces, admin groups, an HTTPS certificate, flow logs and log retention. Override any of them with `-p name=value` or in [`infra/main.bicepparam`](infra/main.bicepparam).
+Everything else has a secure default in [`terraform/variables.tf`](terraform/variables.tf). That includes address spaces, admin groups, an HTTPS certificate, flow logs and log retention. Override any of them in a `terraform.tfvars` file (see [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example)) or as `TF_VAR_<name>` environment variables.
 
 ### Resulting names (resource group `rg-shop-prod` in `eastus2`)
 
@@ -58,7 +58,7 @@ The two vNets are separate and peered. Each is sized at roughly the smallest sup
 | Ingress subnet | `/28` | Internal load balancer frontends only (smallest Azure subnet) |
 | Private endpoint subnet | `/28` | Key Vault and future private endpoints |
 | App Gateway vNet | `/24` | |
-| App Gateway subnet | `/25` | 123 usable IPs ≥ max autoscale (10) with large headroom. Microsoft recommends `/24` if you plan to scale toward 125 instances, so override `agwSubnetPrefix` to use it. |
+| App Gateway subnet | `/25` | 123 usable IPs ≥ max autoscale (10) with large headroom. Microsoft recommends `/24` if you plan to scale toward 125 instances, so override `agw_subnet_prefix` to use it. |
 
 Services use `172.16.0.0/16`. All ranges are parameters, so change them if they overlap your network.
 
@@ -72,7 +72,7 @@ Services use `172.16.0.0/16`. All ranges are parameters, so change them if they 
 
 ### Egress limited by an editable NSG
 
-Outbound rules for the AKS subnets live in [`infra/config/aks-egress-rules.json`](infra/config/aks-egress-rules.json). Edit that file and redeploy to change them. Changes made in the portal are overwritten on the next deployment.
+Outbound rules for the AKS subnets live in [`terraform/config/aks-egress-rules.json`](terraform/config/aks-egress-rules.json). Each entry becomes its own `azurerm_network_security_rule`. Edit that file and re-run the workflow to change them. Terraform reports changes made in the portal as drift and reverts them on the next apply.
 
 Default policy:
 
@@ -98,7 +98,7 @@ Traffic inside the vNet (private endpoints, peered App Gateway) and Azure DNS ar
 | 5 Logging & Monitoring | Diagnostic settings that capture the appropriate categories | AKS control plane (incl. `kube-audit-admin`, `guard`), App Gateway (access + firewall), NSGs, public IPs and Key Vault all send to `<rg>-log` |
 | 5 Logging & Monitoring | Key Vault logging enabled | Key Vault `allLogs` (AuditEvent) to Log Analytics |
 | 6 Networking (6.1 / 6.2) | RDP / SSH access from the Internet is restricted | Both NSGs deny inbound Internet except 80/443 to the App Gateway; nodes have no public IPs |
-| 6 Networking (6.4 – 6.6) | Flow logs captured, retention > 90 days, Network Watcher enabled | Optional VNet flow logs (successor to NSG flow logs) in the regional Network Watcher, 365-day retention, Traffic Analytics (`enableVnetFlowLogs=true`) |
+| 6 Networking (6.4 – 6.6) | Flow logs captured, retention > 90 days, Network Watcher enabled | Optional VNet flow logs (successor to NSG flow logs) in the regional Network Watcher, 365-day retention, Traffic Analytics (`enable_vnet_flow_logs = true`) |
 | 7 Virtual Machines | Disks encrypted | Managed disks encrypted at rest by the platform, plus **encryption at host** on all node pools |
 | 8 Other (Key Vault) | Key Vault recoverable | Soft delete (90 days) and purge protection |
 | 8 Other (Key Vault) | RBAC for Key Vault | `enableRbacAuthorization=true`; least-privilege `Key Vault Secrets User` for the CSI driver and the App Gateway |
@@ -121,8 +121,12 @@ A resource-group deployment cannot set these, so configure them once per subscri
 
 Workflow: [`.github/workflows/deploy-aks.yml`](.github/workflows/deploy-aks.yml)
 
-* **Pull requests**: Bicep build and lint only. No Azure access.
-* **Run workflow** (manual): `lint` → `preview` (validate + what-if, shown in the run summary) → `deploy` (only when `action=deploy`; gated by the `azure-production` environment).
+* **Pull requests**: `terraform fmt -check` and `terraform validate` only. No Azure access.
+* **Run workflow** (manual): `lint` → `plan` (plan shown in the run summary) → `apply`.
+  * `action=plan` stops after the plan.
+  * `action=apply` applies the **exact saved plan** after approval on the `azure-production` environment.
+  * `action=destroy` plans and applies a destroy through the same approval gate.
+* State is stored per resource group (`<rg>.tfstate`) in an Azure Storage container, using Entra ID auth and blob-lease locking.
 * `deploy_sample_app=true` deploys [`k8s/sample-app.yaml`](k8s/sample-app.yaml) through `az aks command invoke`, because the API server is private. The step then waits for App Gateway backend health and sends a request through the WAF.
 
 ### 1. Create an identity with OIDC federation (no secrets)
@@ -145,23 +149,38 @@ for ENV in azure-preview azure-production; do
 done
 ```
 
-### 2. Grant roles (scoped to the resource group)
+### 2. Create the Terraform state storage (once)
 
-The template creates role assignments and policy assignments, so Contributor alone is not enough:
+```bash
+STATE_RG=rg-tfstate
+STATE_SA=<globally-unique-name>
+az group create -n $STATE_RG -l <region>
+az storage account create -n $STATE_SA -g $STATE_RG --sku Standard_LRS --min-tls-version TLS1_2 \
+  --allow-blob-public-access false --allow-shared-key-access false --https-only true
+az storage container create -n tfstate --account-name $STATE_SA --auth-mode login
+az storage account blob-service-properties update -n $STATE_SA -g $STATE_RG \
+  --enable-versioning true --enable-delete-retention true --delete-retention-days 30
+az role assignment create --assignee "$APP_ID" --role "Storage Blob Data Contributor" \
+  --scope $(az storage account show -n $STATE_SA -g $STATE_RG --query id -o tsv)/blobServices/default/containers/tfstate
+```
+
+### 3. Grant roles (scoped to the resource group)
+
+The configuration creates role assignments and policy assignments, so Contributor alone is not enough:
 
 ```bash
 SCOPE=/subscriptions/$SUB/resourceGroups/$RG
 az role assignment create --assignee "$APP_ID" --role "Contributor"                                 --scope "$SCOPE"
 az role assignment create --assignee "$APP_ID" --role "Role Based Access Control Administrator"    --scope "$SCOPE"
 az role assignment create --assignee "$APP_ID" --role "Resource Policy Contributor"                --scope "$SCOPE"
-# Only if enableVnetFlowLogs=true:
+# Only if enable_vnet_flow_logs = true:
 az role assignment create --assignee "$APP_ID" --role "Network Contributor" \
   --scope /subscriptions/$SUB/resourceGroups/NetworkWatcherRG
 ```
 
-You can constrain `Role Based Access Control Administrator` with a condition that limits it to the roles this template assigns: Network Contributor, Key Vault Secrets User, and Azure Kubernetes Service RBAC Cluster Admin.
+You can constrain `Role Based Access Control Administrator` with a condition that limits it to the roles this configuration assigns: Network Contributor, Key Vault Secrets User, and Azure Kubernetes Service RBAC Cluster Admin.
 
-### 3. One-time subscription prerequisites
+### 4. One-time subscription prerequisites
 
 ```bash
 az feature register --namespace Microsoft.Compute --name EncryptionAtHost
@@ -173,9 +192,12 @@ done
 
 If the `EncryptionAtHost` feature isn't registered, the workflow logs a warning and deploys **without** encryption at host.
 
-### 4. Configure GitHub
+Terraform runs with `resource_provider_registrations = "none"`, because an identity scoped to a resource group cannot register providers. That's why the providers are registered here.
+
+### 5. Configure GitHub
 
 * **Secrets**: `AZURE_CLIENT_ID` (= `$APP_ID`), `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
+* **Variables**: `TFSTATE_RESOURCE_GROUP`, `TFSTATE_STORAGE_ACCOUNT`, `TFSTATE_CONTAINER` (optional, default `tfstate`)
 * **Environments**: `azure-preview` and `azure-production`. Add required reviewers on `azure-production`.
 
 Then run **Actions → Deploy secure AKS environment → Run workflow**.
@@ -187,11 +209,11 @@ Then run **Actions → Deploy secure AKS environment → Run workflow**.
 az aks command invoke -g $RG -n $RG-aks --command "kubectl get nodes -o wide"
 ```
 
-For interactive access, add a jumpbox or Azure Bastion in a peered vNet, or use a self-hosted runner inside the vNet. Admins come from `aksAdminGroupObjectIds`, which are Entra ID groups granted *Azure Kubernetes Service RBAC Cluster Admin*.
+For interactive access, add a jumpbox or Azure Bastion in a peered vNet, or use a self-hosted runner inside the vNet. Admins come from `aks_admin_group_object_ids`, which are Entra ID groups granted *Azure Kubernetes Service RBAC Cluster Admin*.
 
 ## Exposing your applications
 
-App Gateway forwards to the internal load balancer IP `ingressPrivateIp` (default `10.0.1.4`). Expose your ingress controller with a `Service` annotated like this:
+App Gateway forwards to the internal load balancer IP in the `ingress_private_ip` output (default `10.0.1.4`). Expose your ingress controller with a `Service` annotated like this:
 
 ```yaml
 metadata:
@@ -203,37 +225,54 @@ spec:
   type: LoadBalancer
 ```
 
-The App Gateway forwards the client's `Host` header, so host-based ingress rules keep working. The health probe calls `GET /` with host `127.0.0.1` and expects 200–399. Adjust the probe in `infra/modules/appgateway.bicep` if your ingress returns 404 for unknown hosts.
+The App Gateway forwards the client's `Host` header, so host-based ingress rules keep working. The health probe calls `GET /` with host `127.0.0.1` and expects 200–399. Adjust the probe in `terraform/appgateway.tf` if your ingress returns 404 for unknown hosts.
 
 ### HTTPS
 
 1. Import a PFX certificate into the environment's Key Vault. The vault is private, so do this from inside the vNet, or temporarily allow your IP.
-2. Redeploy with `appGatewayCertificateKvUri=https://<vault>.vault.azure.net/secrets/<cert-name>`. Use the versionless URI so the certificate rotates automatically.
+2. Re-apply with `app_gateway_certificate_kv_uri = "https://<vault>.vault.azure.net/secrets/<cert-name>"`. Use the versionless URI so the certificate rotates automatically.
 
 The App Gateway identity `<rg>-id-agw` already has `Key Vault Secrets User` on the vault. The deployment adds an HTTPS listener and a permanent HTTP→HTTPS redirect.
 
 ## Repository layout
 
 ```
-infra/
-  main.bicep                    # orchestration, naming, parameters
-  main.bicepparam               # example parameters for local deploys
+terraform/
+  providers.tf                  # azurerm provider + azurerm (Entra ID auth) backend
+  variables.tf                  # inputs and secure defaults
+  main.tf                       # naming, locals, Log Analytics workspace
+  network.tf                    # vNets, subnets, NSGs + rules, NAT GW, peering
+  aks.tf                        # private AKS cluster, user pool, Container Insights, RBAC
+  appgateway.tf                 # WAF policy + App Gateway WAF_v2
+  keyvault.tf                   # Key Vault, private endpoint, private DNS, RBAC
+  policy.tf                     # Azure Policy assignments (internal LB, pod security)
+  flowlogs.tf                   # optional VNet flow logs
+  outputs.tf
   config/aks-egress-rules.json  # editable AKS egress NSG rules
-  modules/
-    network.bicep               # vNets, subnets, NSGs, NAT GW, peering
-    aks.bicep                   # private AKS cluster, Container Insights, RBAC
-    appgateway.bicep            # WAF policy + App Gateway WAF_v2
-    keyvault.bicep              # Key Vault, private endpoint, private DNS
-    monitoring.bicep            # Log Analytics workspace
-    policy.bicep                # Azure Policy assignments (internal LB, pod security)
-    flowlogs.bicep              # optional VNet flow logs
+  terraform.tfvars.example
+  .terraform.lock.hcl           # pinned provider version (azurerm 4.81.0)
 k8s/sample-app.yaml             # smoke-test app on the internal LB
 .github/workflows/deploy-aks.yml
 ```
 
-## Local deployment
+## Local usage
 
 ```bash
-az deployment group what-if  -g rg-shop-prod -f infra/main.bicep -p infra/main.bicepparam
-az deployment group create   -g rg-shop-prod -f infra/main.bicep -p infra/main.bicepparam
+cd terraform
+cp terraform.tfvars.example terraform.tfvars   # set resource_group_name etc.
+az login
+export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+terraform init \
+  -backend-config="resource_group_name=$STATE_RG" \
+  -backend-config="storage_account_name=$STATE_SA" \
+  -backend-config="container_name=tfstate" \
+  -backend-config="key=rg-shop-prod.tfstate"
+terraform plan -out tfplan
+terraform apply tfplan
+```
+
+The committed lock file has provider hashes for `linux_amd64`, the platform GitHub runners use. On macOS or Windows, add yours first:
+
+```bash
+terraform providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=windows_amd64
 ```

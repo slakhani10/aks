@@ -1,10 +1,20 @@
-# Bicep build output
-*.json.bak
-infra/**/*.json
-!infra/config/*.json
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+tfplan
+plan.txt
+outputs.json
 
 # Local
 .env
-whatif.txt
-outputs.json
 invoke/

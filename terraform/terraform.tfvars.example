@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars for local runs. The GitHub workflow passes these as TF_VAR_* instead.
+resource_group_name = "rg-shop-prod" # must already exist
+
+system_node_vm_size = "Standard_D4ds_v5"
+system_node_count   = 3
+user_node_vm_size   = "Standard_D4ds_v5"
+user_node_count     = 2
+
+# Optional
+# aks_admin_group_object_ids     = ["00000000-0000-0000-0000-000000000000"]
+# app_gateway_certificate_kv_uri = "https://<vault>.vault.azure.net/secrets/<cert-name>"
+# enable_vnet_flow_logs          = true
