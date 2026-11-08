@@ -1,0 +1,260 @@
+name: Deploy secure AKS environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Existing resource group (also used as the naming prefix and region)"
+        required: true
+        type: string
+      system_node_vm_size:
+        description: "System node pool VM SKU"
+        required: true
+        default: "Standard_D4ds_v5"
+        type: string
+      system_node_count:
+        description: "System node pool node count"
+        required: true
+        default: 3
+        type: number
+      user_node_vm_size:
+        description: "User node pool VM SKU (empty = same as system)"
+        required: false
+        default: ""
+        type: string
+      user_node_count:
+        description: "User node pool node count"
+        required: true
+        default: 2
+        type: number
+      action:
+        description: "what-if = preview only, deploy = apply changes"
+        required: true
+        default: "what-if"
+        type: choice
+        options:
+          - what-if
+          - deploy
+      deploy_sample_app:
+        description: "Deploy the smoke-test app behind the App Gateway after deployment"
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - "infra/**"
+      - "k8s/**"
+      - ".github/workflows/deploy-aks.yml"
+
+permissions:
+  contents: read
+  id-token: write # OIDC federation to Entra ID - no client secrets stored in GitHub
+
+concurrency:
+  group: aks-${{ inputs.resource_group || github.ref }}
+  cancel-in-progress: false
+
+env:
+  TEMPLATE_FILE: infra/main.bicep
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & build Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bicep
+        run: az bicep install && az bicep version
+
+      - name: Build
+        run: az bicep build --file "$TEMPLATE_FILE" --stdout > /dev/null
+
+      - name: Lint
+        run: az bicep lint --file "$TEMPLATE_FILE"
+
+  # ---------------------------------------------------------------------------
+  preview:
+    name: Validate & what-if
+    if: github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    environment: azure-preview
+    outputs:
+      params: ${{ steps.params.outputs.params }}
+    env:
+      RG: ${{ inputs.resource_group }}
+      SYSTEM_VM: ${{ inputs.system_node_vm_size }}
+      SYSTEM_COUNT: ${{ inputs.system_node_count }}
+      USER_VM: ${{ inputs.user_node_vm_size }}
+      USER_COUNT: ${{ inputs.user_node_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check resource group exists
+        run: |
+          if [ "$(az group exists --name "$RG")" != "true" ]; then
+            echo "::error::Resource group '$RG' does not exist. This workflow never creates resource groups."
+            exit 1
+          fi
+          echo "Region: $(az group show -n "$RG" --query location -o tsv)"
+
+      - name: Build parameters
+        id: params
+        run: |
+          set -euo pipefail
+
+          # Object ID of the pipeline identity (from the ARM token) so it can run
+          # 'az aks command invoke' against the private cluster with Azure RBAC.
+          DEPLOYER_OID=$(az account get-access-token --query accessToken -o tsv | python3 -c '
+          import sys, json, base64
+          p = sys.stdin.read().strip().split(".")[1]
+          p += "=" * (-len(p) % 4)
+          print(json.loads(base64.urlsafe_b64decode(p))["oid"])')
+
+          # Encryption at host requires a subscription feature flag.
+          FEATURE_STATE=$(az feature show --namespace Microsoft.Compute --name EncryptionAtHost \
+                            --query properties.state -o tsv 2>/dev/null || echo "Unknown")
+          ENC_AT_HOST=true
+          case "$FEATURE_STATE" in
+            Registered) ;;
+            Unknown) echo "::notice::Cannot read EncryptionAtHost feature state (insufficient permissions?). Assuming it is registered." ;;
+            *) ENC_AT_HOST=false
+               echo "::warning::Microsoft.Compute/EncryptionAtHost is '$FEATURE_STATE'. Deploying WITHOUT encryption at host. Run 'az feature register --namespace Microsoft.Compute --name EncryptionAtHost' and redeploy." ;;
+          esac
+
+          PARAMS="systemNodeVmSize=$SYSTEM_VM systemNodeCount=$SYSTEM_COUNT userNodeCount=$USER_COUNT deployerPrincipalId=$DEPLOYER_OID enableEncryptionAtHost=$ENC_AT_HOST"
+          if [ -n "$USER_VM" ]; then
+            PARAMS="$PARAMS userNodeVmSize=$USER_VM"
+          fi
+
+          # Reject anything that is not a plain key=value token (inputs are user supplied).
+          for p in $PARAMS; do
+            [[ "$p" =~ ^[A-Za-z]+=[A-Za-z0-9_.-]+$ ]] || { echo "::error::Invalid parameter value: $p"; exit 1; }
+          done
+          echo "params=$PARAMS" >> "$GITHUB_OUTPUT"
+
+      - name: Validate
+        env:
+          PARAMS: ${{ steps.params.outputs.params }}
+        run: |
+          # shellcheck disable=SC2086
+          az deployment group validate \
+            --resource-group "$RG" \
+            --template-file "$TEMPLATE_FILE" \
+            --parameters $PARAMS \
+            --output none
+
+      - name: What-if
+        env:
+          PARAMS: ${{ steps.params.outputs.params }}
+        run: |
+          # shellcheck disable=SC2086
+          az deployment group what-if \
+            --resource-group "$RG" \
+            --template-file "$TEMPLATE_FILE" \
+            --parameters $PARAMS \
+            --result-format FullResourcePayloads | tee whatif.txt
+          {
+            echo "## What-if for \`$RG\`"
+            echo '```'
+            tail -n 60 whatif.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'deploy'
+    needs: preview
+    runs-on: ubuntu-latest
+    # Configure required reviewers on this environment to gate production changes.
+    environment: azure-production
+    env:
+      RG: ${{ inputs.resource_group }}
+      PARAMS: ${{ needs.preview.outputs.params }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        id: deploy
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          az deployment group create \
+            --resource-group "$RG" \
+            --name "secure-aks-${GITHUB_RUN_ID}" \
+            --template-file "$TEMPLATE_FILE" \
+            --parameters $PARAMS \
+            --query properties.outputs -o json > outputs.json
+
+          for key in aksName appGatewayName appGatewayPublicIp appGatewayFqdn ingressPrivateIp ingressSubnetName keyVaultName natGatewayPublicIp; do
+            echo "$key=$(jq -r ".${key}.value" outputs.json)" >> "$GITHUB_OUTPUT"
+          done
+
+          {
+            echo "## Deployed \`$RG\`"
+            echo "| Output | Value |"
+            echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.value) |"' outputs.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy smoke-test app (via az aks command invoke)
+        if: inputs.deploy_sample_app
+        env:
+          AKS_NAME: ${{ steps.deploy.outputs.aksName }}
+          INGRESS_IP: ${{ steps.deploy.outputs.ingressPrivateIp }}
+          INGRESS_SUBNET: ${{ steps.deploy.outputs.ingressSubnetName }}
+        run: |
+          set -euo pipefail
+          mkdir -p invoke
+          envsubst '${INGRESS_IP} ${INGRESS_SUBNET}' < k8s/sample-app.yaml > invoke/sample-app.yaml
+
+          # The API server is private; command invoke runs kubectl inside the cluster
+          # through the ARM control plane. Retry while the RBAC assignment propagates.
+          for attempt in 1 2 3 4 5 6; do
+            if result=$(az aks command invoke -g "$RG" -n "$AKS_NAME" \
+                  --command "kubectl apply -f sample-app.yaml && kubectl -n sample-app rollout status deploy/hello --timeout=180s" \
+                  --file invoke/sample-app.yaml -o json); then
+              echo "$result" | jq -r '.logs'
+              [ "$(echo "$result" | jq -r '.exitCode')" = "0" ] && exit 0
+            fi
+            echo "Attempt $attempt failed, retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::Sample app deployment failed"
+          exit 1
+
+      - name: Verify traffic flows through the App Gateway WAF
+        if: inputs.deploy_sample_app
+        env:
+          AGW_NAME: ${{ steps.deploy.outputs.appGatewayName }}
+          AGW_IP: ${{ steps.deploy.outputs.appGatewayPublicIp }}
+        run: |
+          for attempt in $(seq 1 20); do
+            health=$(az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" \
+                       --query 'backendAddressPools[0].backendHttpSettingsCollection[0].servers[0].health' -o tsv)
+            echo "Backend health: $health"
+            if [ "$health" = "Healthy" ]; then
+              curl -fsS -o /dev/null -w "HTTP %{http_code} from http://$AGW_IP\n" "http://$AGW_IP/"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::App Gateway backend did not become healthy"
+          exit 1

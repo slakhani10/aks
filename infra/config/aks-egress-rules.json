@@ -1,0 +1,56 @@
+[
+  {
+    "name": "Allow-AzureActiveDirectory-443",
+    "description": "Entra ID token acquisition (login.microsoftonline.com) for kubelet, add-ons and workload identity.",
+    "priority": 100,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "AzureActiveDirectory",
+    "destinationPortRanges": ["443"],
+    "access": "Allow"
+  },
+  {
+    "name": "Allow-MicrosoftContainerRegistry-443",
+    "description": "Microsoft Artifact Registry (mcr.microsoft.com) for AKS system images.",
+    "priority": 110,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "MicrosoftContainerRegistry",
+    "destinationPortRanges": ["443"],
+    "access": "Allow"
+  },
+  {
+    "name": "Allow-AzureFrontDoorFirstParty-443",
+    "description": "Dependency of MicrosoftContainerRegistry (*.data.mcr.microsoft.com) and packages.aks.azure.com.",
+    "priority": 120,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "AzureFrontDoor.FirstParty",
+    "destinationPortRanges": ["443"],
+    "access": "Allow"
+  },
+  {
+    "name": "Allow-AzureMonitor-443",
+    "description": "Container Insights / Azure Monitor agent data ingestion.",
+    "priority": 130,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "AzureMonitor",
+    "destinationPortRanges": ["443"],
+    "access": "Allow"
+  },
+  {
+    "name": "Allow-AzureCloud-443",
+    "description": "Catch-all for AKS FQDN dependencies hosted in Azure without a dedicated service tag (management.azure.com, packages.aks.azure.com, Defender, Policy). Narrow or remove once you front egress with Azure Firewall.",
+    "priority": 140,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "AzureCloud",
+    "destinationPortRanges": ["443"],
+    "access": "Allow"
+  },
+  {
+    "name": "Deny-Internet-Outbound",
+    "description": "Block all other Internet egress from the AKS subnets. Traffic to the virtual network (private endpoints, peered vNets) is still allowed by the default AllowVnetOutBound rule.",
+    "priority": 4000,
+    "protocol": "*",
+    "destinationAddressPrefix": "Internet",
+    "destinationPortRanges": ["*"],
+    "access": "Deny"
+  }
+]

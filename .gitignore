@@ -1,0 +1,10 @@
+# Bicep build output
+*.json.bak
+infra/**/*.json
+!infra/config/*.json
+
+# Local
+.env
+whatif.txt
+outputs.json
+invoke/

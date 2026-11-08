@@ -1,0 +1,90 @@
+# Smoke-test workload exposed ONLY on the AKS internal load balancer.
+# ${INGRESS_IP} and ${INGRESS_SUBNET} are substituted by the workflow (envsubst)
+# with the deployment outputs; App Gateway's backend pool already points at that IP.
+#
+# For real workloads, replace this with an ingress controller (e.g. ingress-nginx or
+# the AKS application routing add-on) whose Service uses the same annotations.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello
+  template:
+    metadata:
+      labels:
+        app: hello
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: hello
+          image: mcr.microsoft.com/azuredocs/aks-helloworld:v1
+          ports:
+            - containerPort: 80
+          env:
+            - name: TITLE
+              value: "Secure AKS behind Application Gateway WAF"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: sample-app
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "${INGRESS_SUBNET}"
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: "${INGRESS_IP}"
+spec:
+  type: LoadBalancer
+  selector:
+    app: hello
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+# Default-deny ingress for the namespace, then allow only HTTP to the app.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: sample-app
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-http-to-hello
+  namespace: sample-app
+spec:
+  podSelector:
+    matchLabels:
+      app: hello
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 80
