@@ -34,12 +34,11 @@ resource "azurerm_private_dns_zone_virtual_network_link" "kv" {
     agw = azurerm_virtual_network.agw
   }
 
-  name                  = "${each.value.name}-link"
-  resource_group_name   = local.rg_name
-  private_dns_zone_name = azurerm_private_dns_zone.kv.name
-  virtual_network_id    = each.value.id
-  registration_enabled  = false
-  tags                  = local.tags
+  name                 = "${each.value.name}-link"
+  private_dns_zone_id  = azurerm_private_dns_zone.kv.id # azurerm 5.x: zone (and its RG) referenced by ID
+  virtual_network_id   = each.value.id
+  registration_enabled = false
+  tags                 = local.tags
 }
 
 resource "azurerm_private_endpoint" "kv" {

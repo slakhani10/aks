@@ -60,6 +60,12 @@ resource "azurerm_kubernetes_cluster" "this" {
   automatic_upgrade_channel = "patch"
   node_os_upgrade_channel   = "NodeImage"
 
+  # Required by azurerm 5.x. "Manual" = node pools are defined explicitly below
+  # (VM size and count are inputs); Node Auto Provisioning is not used.
+  node_provisioning_profile {
+    mode = "Manual"
+  }
+
   default_node_pool {
     name                         = "system"
     vm_size                      = var.system_node_vm_size

@@ -1,6 +1,6 @@
 # Secure AKS environment (CIS Microsoft Azure Foundations Benchmark v1.4)
 
-This repo holds Terraform (azurerm provider 4.x) and a GitHub Actions workflow. They deploy a private Azure Kubernetes Service (AKS) cluster into an **existing** resource group. The cluster is reachable from the Internet **only** through an Application Gateway with WAF.
+This repo holds Terraform (azurerm provider 5.x) and a GitHub Actions workflow. They deploy a private Azure Kubernetes Service (AKS) cluster into an **existing** resource group. The cluster is reachable from the Internet **only** through an Application Gateway with WAF.
 
 ```
                      Internet
@@ -267,7 +267,7 @@ terraform/
   config/aks-egress-rules.json  # editable AKS egress NSG rules
   terraform.tfvars.example
   tests/                        # offline `terraform test` suite (mocked provider)
-  .terraform.lock.hcl           # pinned provider version (azurerm 4.81.0)
+  .terraform.lock.hcl           # pinned provider version (azurerm 5.13.0)
 k8s/sample-app.yaml             # smoke-test app on the internal LB
 .github/workflows/deploy-aks.yml
 ```
