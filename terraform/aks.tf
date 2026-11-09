@@ -87,7 +87,7 @@ resource "azurerm_kubernetes_cluster" "this" {
     network_policy      = "cilium"
     pod_cidr            = var.pod_cidr
     service_cidr        = var.service_cidr
-    dns_service_ip      = var.dns_service_ip
+    dns_service_ip      = local.dns_service_ip
     load_balancer_sku   = "standard"
     outbound_type       = "userAssignedNATGateway"
   }

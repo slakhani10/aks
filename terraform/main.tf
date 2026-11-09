@@ -20,11 +20,10 @@ locals {
   location = data.azurerm_resource_group.this.location
   rg_name  = data.azurerm_resource_group.this.name
 
-  tags = merge(data.azurerm_resource_group.this.tags, {
-    workload            = "aks"
-    "security-baseline" = "cis-azure-foundations-1.4"
-    "managed-by"        = "terraform"
-  })
+  # Every taggable resource gets the resource group's tags (plus optional
+  # additional_tags; the resource group's value wins if a key exists in both).
+  # The AKS cluster also propagates these to the resources in its node resource group.
+  tags = merge(var.additional_tags, data.azurerm_resource_group.this.tags)
 
   # Alphanumeric-only prefix for resources with strict naming rules (Key Vault, Storage).
   alnum_prefix       = replace(local.prefix, "/[^a-z0-9]/", "")
@@ -38,7 +37,7 @@ locals {
 
   # Static private IP of the AKS internal LB that App Gateway forwards to
   # (first usable address in an Azure subnet: .4).
-  ingress_private_ip = cidrhost(var.aks_ingress_subnet_prefix, 4)
+  ingress_private_ip = cidrhost(local.aks_ingress_subnet_cidr, 4)
 
   egress_rules = jsondecode(file("${path.module}/config/aks-egress-rules.json"))
 }

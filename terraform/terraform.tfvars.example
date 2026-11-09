@@ -6,7 +6,14 @@ system_node_count   = 3
 user_node_vm_size   = "Standard_D4ds_v5"
 user_node_count     = 2
 
+# Network ranges (subnets are derived automatically; ranges must not overlap)
+aks_vnet_cidr = "10.0.0.0/22"   # /16 - /23
+agw_vnet_cidr = "10.1.0.0/24"   # /16 - /25
+pod_cidr      = "10.244.0.0/16" # /12 - /20, overlay only
+service_cidr  = "172.16.0.0/16" # /12 - /24
+
 # Optional
 # aks_admin_group_object_ids     = ["00000000-0000-0000-0000-000000000000"]
 # app_gateway_certificate_kv_uri = "https://<vault>.vault.azure.net/secrets/<cert-name>"
 # enable_vnet_flow_logs          = true
+# additional_tags                = { owner = "platform-team" } # resource group tags are always copied

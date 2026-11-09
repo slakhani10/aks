@@ -30,8 +30,12 @@ This repo holds Terraform (azurerm provider 4.x) and a GitHub Actions workflow. 
 | `system_node_count` | yes | `3` | System pool node count (1–100) |
 | `user_node_vm_size` | no | same as system | Workload pool SKU |
 | `user_node_count` | yes | `2` | Workload pool node count (0–1000) |
+| `aks_vnet_cidr` | yes | `10.0.0.0/22` | AKS vNet range, `/16`–`/23`. Subnets are derived from it (see below). |
+| `agw_vnet_cidr` | yes | `10.1.0.0/24` | App Gateway vNet range, `/16`–`/25` |
+| `pod_cidr` | no | `10.244.0.0/16` | Overlay pod range, `/12`–`/20`. In the workflow: repository variable `AKS_POD_CIDR`. |
+| `service_cidr` | no | `172.16.0.0/16` | Kubernetes service range, `/12`–`/24`; DNS service = 10th address. In the workflow: repository variable `AKS_SERVICE_CIDR`. |
 
-Everything else has a secure default in [`terraform/variables.tf`](terraform/variables.tf). That includes address spaces, admin groups, an HTTPS certificate, flow logs and log retention. Override any of them in a `terraform.tfvars` file (see [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example)) or as `TF_VAR_<name>` environment variables.
+Everything else has a secure default in [`terraform/variables.tf`](terraform/variables.tf). That includes admin groups, an HTTPS certificate, flow logs and log retention. Override any of them in a `terraform.tfvars` file (see [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example)) or as `TF_VAR_<name>` environment variables.
 
 ### Resulting names (resource group `rg-shop-prod` in `eastus2`)
 
@@ -49,18 +53,28 @@ Everything else has a secure default in [`terraform/variables.tf`](terraform/var
 
 ## Network design and sizing
 
-The two vNets are separate and peered. Each is sized at roughly the smallest supported size, with room to grow:
+The two vNets are separate and peered. You only pass the two vNet ranges; the subnets are carved out of them automatically, so they can never be misaligned. The defaults are roughly the smallest supported sizes, with room to grow:
 
-| vNet / subnet | Size | Rationale |
-|---|---|---|
-| AKS vNet | `/22` | Room for extra node pools or subnets |
-| Node subnet | `/24` | Azure CNI **Overlay**: pods use `10.244.0.0/16`, so the subnet only holds node IPs (251 nodes) |
-| Ingress subnet | `/28` | Internal load balancer frontends only (smallest Azure subnet) |
-| Private endpoint subnet | `/28` | Key Vault and future private endpoints |
-| App Gateway vNet | `/24` | |
-| App Gateway subnet | `/25` | 123 usable IPs ≥ max autoscale (10) with large headroom. Microsoft recommends `/24` if you plan to scale toward 125 instances, so override `agw_subnet_prefix` to use it. |
+| vNet / subnet | Derived as | Default | Rationale |
+|---|---|---|---|
+| AKS vNet | `aks_vnet_cidr` | `10.0.0.0/22` | `/23` minimum; anything beyond it is free for extra node pools or subnets |
+| Node subnet | 1st `/24` | `10.0.0.0/24` | Azure CNI **Overlay**: pods use `pod_cidr`, so the subnet only holds node IPs (251 nodes) |
+| Ingress subnet | 1st `/28` of the 2nd `/24` | `10.0.1.0/28` | Internal load balancer frontends only (smallest Azure subnet); App Gateway targets its `.4` address |
+| Private endpoint subnet | next `/28` | `10.0.1.16/28` | Key Vault and future private endpoints |
+| App Gateway vNet | `agw_vnet_cidr` | `10.1.0.0/24` | `/25` minimum |
+| App Gateway subnet | 1st `/25` | `10.1.0.0/25` | 123 usable IPs ≥ max autoscale (10) with large headroom. Microsoft recommends a `/24` subnet if you plan to scale toward 125 instances, which needs an `agw_vnet_cidr` of `/23` or larger and a one-line change in `terraform/network.tf`. |
 
-Services use `172.16.0.0/16`. All ranges are parameters, so change them if they overlap your network.
+Rules enforced at `terraform plan` time:
+* Each range must be a valid IPv4 network (e.g. `10.0.0.0/22`, not `10.0.1.0/22`) within the allowed sizes.
+* The AKS vNet, App Gateway vNet, pod and service ranges must not overlap each other. The plan fails with a message naming the overlapping pair.
+
+You still need to make sure the ranges don't overlap networks outside this deployment that you peer or route to.
+
+## Tags
+
+Every resource that supports tags gets a copy of the **resource group's tags**. This includes both node pools; AKS also propagates the cluster's tags to the resources it creates in the node resource group. Change a tag on the resource group and the next `apply` updates all resources.
+
+To add tags that aren't on the resource group, set `additional_tags`. If a key exists in both, the resource group's value wins. Some resource types can't hold tags in Azure: subnets, NSG rules, peerings, role and policy assignments, and diagnostic settings.
 
 ### No direct Internet ingress to AKS
 
@@ -121,7 +135,7 @@ A resource-group deployment cannot set these, so configure them once per subscri
 
 Workflow: [`.github/workflows/deploy-aks.yml`](.github/workflows/deploy-aks.yml)
 
-* **Pull requests**: `terraform fmt -check` and `terraform validate` only. No Azure access.
+* **Pull requests**: `terraform fmt -check`, `terraform validate` and `terraform test` (mocked provider). No Azure access.
 * **Run workflow** (manual): `lint` → `plan` (plan shown in the run summary) → `apply`.
   * `action=plan` stops after the plan.
   * `action=apply` applies the **exact saved plan** after approval on the `azure-production` environment.
@@ -197,7 +211,7 @@ Terraform runs with `resource_provider_registrations = "none"`, because an ident
 ### 5. Configure GitHub
 
 * **Secrets**: `AZURE_CLIENT_ID` (= `$APP_ID`), `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
-* **Variables**: `TFSTATE_RESOURCE_GROUP`, `TFSTATE_STORAGE_ACCOUNT`, `TFSTATE_CONTAINER` (optional, default `tfstate`)
+* **Variables**: `TFSTATE_RESOURCE_GROUP`, `TFSTATE_STORAGE_ACCOUNT`, `TFSTATE_CONTAINER` (optional, default `tfstate`), and optionally `AKS_POD_CIDR` / `AKS_SERVICE_CIDR`
 * **Environments**: `azure-preview` and `azure-production`. Add required reviewers on `azure-production`.
 
 Then run **Actions → Deploy secure AKS environment → Run workflow**.
@@ -250,6 +264,7 @@ terraform/
   outputs.tf
   config/aks-egress-rules.json  # editable AKS egress NSG rules
   terraform.tfvars.example
+  tests/                        # offline `terraform test` suite (mocked provider)
   .terraform.lock.hcl           # pinned provider version (azurerm 4.81.0)
 k8s/sample-app.yaml             # smoke-test app on the internal LB
 .github/workflows/deploy-aks.yml

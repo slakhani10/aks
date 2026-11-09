@@ -37,7 +37,7 @@
   },
   {
     "name": "Allow-AzureCloud-443",
-    "description": "Catch-all for AKS FQDN dependencies hosted in Azure without a dedicated service tag (management.azure.com, packages.aks.azure.com, Defender, Policy). Narrow or remove once you front egress with Azure Firewall.",
+    "description": "Azure-hosted AKS dependencies without their own service tag (ARM, packages.aks.azure.com, Defender). Narrow once egress uses Azure Firewall.",
     "priority": 140,
     "protocol": "Tcp",
     "destinationAddressPrefix": "AzureCloud",
@@ -46,7 +46,7 @@
   },
   {
     "name": "Deny-Internet-Outbound",
-    "description": "Block all other Internet egress from the AKS subnets. Traffic to the virtual network (private endpoints, peered vNets) is still allowed by the default AllowVnetOutBound rule.",
+    "description": "Block all other Internet egress. vNet traffic (private endpoints, peered vNets) is still allowed by the default AllowVnetOutBound rule.",
     "priority": 4000,
     "protocol": "*",
     "destinationAddressPrefix": "Internet",

@@ -27,6 +27,16 @@ on:
         required: true
         default: 2
         type: number
+      aks_vnet_cidr:
+        description: "AKS vNet CIDR (/16-/23). Subnets are derived from it"
+        required: true
+        default: "10.0.0.0/22"
+        type: string
+      agw_vnet_cidr:
+        description: "App Gateway vNet CIDR (/16-/25). Must not overlap the AKS vNet"
+        required: true
+        default: "10.1.0.0/24"
+        type: string
       action:
         description: "plan = preview only, apply = apply the reviewed plan, destroy = plan + apply a destroy"
         required: true
@@ -90,6 +100,9 @@ jobs:
           terraform init -backend=false
           terraform validate
 
+      - name: terraform test (offline, mocked provider)
+        run: terraform test
+
   # ---------------------------------------------------------------------------
   plan:
     name: Plan
@@ -107,6 +120,8 @@ jobs:
       TF_VAR_system_node_count: ${{ inputs.system_node_count }}
       TF_VAR_user_node_vm_size: ${{ inputs.user_node_vm_size }}
       TF_VAR_user_node_count: ${{ inputs.user_node_count }}
+      TF_VAR_aks_vnet_cidr: ${{ inputs.aks_vnet_cidr }}
+      TF_VAR_agw_vnet_cidr: ${{ inputs.agw_vnet_cidr }}
     steps:
       - uses: actions/checkout@v4
 
@@ -129,6 +144,15 @@ jobs:
             exit 1
           fi
           echo "Region: $(az group show -n "$RG" --query location -o tsv)"
+
+      - name: Optional pod / service CIDRs (repository variables)
+        env:
+          POD_CIDR: ${{ vars.AKS_POD_CIDR }}
+          SERVICE_CIDR: ${{ vars.AKS_SERVICE_CIDR }}
+        run: |
+          # Unset variables keep the Terraform defaults (10.244.0.0/16 and 172.16.0.0/16).
+          if [ -n "$POD_CIDR" ];     then echo "TF_VAR_pod_cidr=$POD_CIDR"         >> "$GITHUB_ENV"; fi
+          if [ -n "$SERVICE_CIDR" ]; then echo "TF_VAR_service_cidr=$SERVICE_CIDR" >> "$GITHUB_ENV"; fi
 
       - name: Check encryption-at-host feature
         run: |

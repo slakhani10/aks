@@ -81,6 +81,12 @@ variable "network_watcher_resource_group" {
   default     = "NetworkWatcherRG"
 }
 
+variable "additional_tags" {
+  description = "Optional extra tags added to every resource. Resource group tags are always copied and win on key conflicts."
+  type        = map(string)
+  default     = {}
+}
+
 variable "log_retention_days" {
   description = "Log Analytics retention in days."
   type        = number
@@ -105,53 +111,71 @@ variable "app_gateway_max_capacity" {
 }
 
 # ------------------------------------------------------------ Address space ----
-# AKS vNet /22. With Azure CNI Overlay pods use pod_cidr, so the node subnet only
-# needs node IPs: /24 = 251 nodes. The remaining /23 is free for growth.
-variable "aks_vnet_address_prefix" {
-  type    = string
-  default = "10.0.0.0/22"
-}
+# Only the four top-level ranges are inputs. Subnets are carved out of the vNet
+# ranges automatically (see locals in network.tf), so they always line up.
+# All four ranges must be IPv4, must not overlap each other, and must not overlap
+# any network you peer or route to. Overlaps are rejected at plan time.
 
-variable "aks_node_subnet_prefix" {
-  type    = string
-  default = "10.0.0.0/24"
-}
-
-variable "aks_ingress_subnet_prefix" {
-  description = "Subnet hosting the AKS internal load balancer frontend IP(s) used by App Gateway."
+variable "aks_vnet_cidr" {
+  description = <<-EOT
+    Address space of the AKS vNet. Must be /23 or larger (/16-/23). Carved into:
+      node subnet              /24 (1st /24)  - Azure CNI Overlay: nodes only, 251 nodes
+      internal ingress subnet  /28 (start of the 2nd /24)
+      private endpoint subnet  /28 (next /28)
+    Anything left over (e.g. the other /23 of a /22) is free for growth.
+  EOT
   type        = string
-  default     = "10.0.1.0/28"
+  default     = "10.0.0.0/22"
+
+  validation {
+    condition     = can(cidrnetmask(var.aks_vnet_cidr)) && tonumber(split("/", var.aks_vnet_cidr)[1]) >= 16 && tonumber(split("/", var.aks_vnet_cidr)[1]) <= 23
+    error_message = "aks_vnet_cidr must be a valid IPv4 CIDR between /16 and /23 (e.g. 10.0.0.0/22)."
+  }
+
+  validation {
+    condition     = can(cidrnetmask(var.aks_vnet_cidr)) && cidrsubnet(var.aks_vnet_cidr, 0, 0) == var.aks_vnet_cidr
+    error_message = "aks_vnet_cidr must start on its network boundary (e.g. 10.0.0.0/22, not 10.0.1.0/22)."
+  }
 }
 
-variable "aks_private_endpoint_subnet_prefix" {
-  type    = string
-  default = "10.0.1.16/28"
+variable "agw_vnet_cidr" {
+  description = <<-EOT
+    Address space of the Application Gateway vNet. Must be /25 or larger (/16-/25).
+    The App Gateway subnet is the first /25 (123 usable IPs, well above the max
+    autoscale capacity); anything left over is free.
+  EOT
+  type        = string
+  default     = "10.1.0.0/24"
+
+  validation {
+    condition     = can(cidrnetmask(var.agw_vnet_cidr)) && tonumber(split("/", var.agw_vnet_cidr)[1]) >= 16 && tonumber(split("/", var.agw_vnet_cidr)[1]) <= 25
+    error_message = "agw_vnet_cidr must be a valid IPv4 CIDR between /16 and /25 (e.g. 10.1.0.0/24)."
+  }
+
+  validation {
+    condition     = can(cidrnetmask(var.agw_vnet_cidr)) && cidrsubnet(var.agw_vnet_cidr, 0, 0) == var.agw_vnet_cidr
+    error_message = "agw_vnet_cidr must start on its network boundary (e.g. 10.1.0.0/24)."
+  }
 }
 
-# App Gateway vNet /24. AGW subnet /25 = 123 usable IPs, well above the max
-# autoscale capacity; the other /25 is free.
-variable "agw_vnet_address_prefix" {
-  type    = string
-  default = "10.1.0.0/24"
-}
-
-variable "agw_subnet_prefix" {
-  type    = string
-  default = "10.1.0.0/25"
-}
-
-# Overlay ranges - must not overlap any network you peer or route to.
 variable "pod_cidr" {
-  type    = string
-  default = "10.244.0.0/16"
+  description = "Azure CNI Overlay pod range (not routable outside the cluster). Each node gets a /24, so /16 = up to 256 nodes. Allowed /12-/20."
+  type        = string
+  default     = "10.244.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.pod_cidr)) && tonumber(split("/", var.pod_cidr)[1]) >= 12 && tonumber(split("/", var.pod_cidr)[1]) <= 20 && cidrsubnet(var.pod_cidr, 0, 0) == var.pod_cidr
+    error_message = "pod_cidr must be a valid IPv4 network CIDR between /12 and /20 (e.g. 10.244.0.0/16)."
+  }
 }
 
 variable "service_cidr" {
-  type    = string
-  default = "172.16.0.0/16"
-}
+  description = "Kubernetes service range. The cluster DNS service uses the 10th address. Allowed /12-/24."
+  type        = string
+  default     = "172.16.0.0/16"
 
-variable "dns_service_ip" {
-  type    = string
-  default = "172.16.0.10"
+  validation {
+    condition     = can(cidrnetmask(var.service_cidr)) && tonumber(split("/", var.service_cidr)[1]) >= 12 && tonumber(split("/", var.service_cidr)[1]) <= 24 && cidrsubnet(var.service_cidr, 0, 0) == var.service_cidr
+    error_message = "service_cidr must be a valid IPv4 network CIDR between /12 and /24 (e.g. 172.16.0.0/16)."
+  }
 }

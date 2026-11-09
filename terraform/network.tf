@@ -7,6 +7,41 @@
 # -----------------------------------------------------------------------------
 
 locals {
+  # --------------------------------------------- Subnets derived from inputs --
+  aks_vnet_bits = tonumber(split("/", var.aks_vnet_cidr)[1])
+  agw_vnet_bits = tonumber(split("/", var.agw_vnet_cidr)[1])
+
+  aks_node_subnet_cidr    = cidrsubnet(var.aks_vnet_cidr, 24 - local.aks_vnet_bits, 0)  # 1st /24
+  aks_ingress_subnet_cidr = cidrsubnet(var.aks_vnet_cidr, 28 - local.aks_vnet_bits, 16) # /28 at start of 2nd /24
+  aks_pe_subnet_cidr      = cidrsubnet(var.aks_vnet_cidr, 28 - local.aks_vnet_bits, 17) # next /28
+  agw_subnet_cidr         = cidrsubnet(var.agw_vnet_cidr, 25 - local.agw_vnet_bits, 0)  # 1st /25
+
+  dns_service_ip = cidrhost(var.service_cidr, 10)
+
+  # ------------------------------------------------- Overlap detection --------
+  # [first, last] address of each range as integers.
+  cidr_ranges = {
+    for name, cidr in {
+      aks_vnet = var.aks_vnet_cidr
+      agw_vnet = var.agw_vnet_cidr
+      pod      = var.pod_cidr
+      service  = var.service_cidr
+      } : name => {
+      cidr  = cidr
+      first = sum([for i, o in split(".", cidrhost(cidr, 0)) : tonumber(o) * pow(256, 3 - i)])
+      size  = pow(2, 32 - tonumber(split("/", cidr)[1]))
+    }
+  }
+
+  cidr_names = keys(local.cidr_ranges)
+  cidr_overlaps = [
+    for pair in setproduct(range(length(local.cidr_names)), range(length(local.cidr_names))) :
+    "${local.cidr_names[pair[0]]} (${local.cidr_ranges[local.cidr_names[pair[0]]].cidr}) overlaps ${local.cidr_names[pair[1]]} (${local.cidr_ranges[local.cidr_names[pair[1]]].cidr})"
+    if pair[0] < pair[1] &&
+    local.cidr_ranges[local.cidr_names[pair[0]]].first < local.cidr_ranges[local.cidr_names[pair[1]]].first + local.cidr_ranges[local.cidr_names[pair[1]]].size &&
+    local.cidr_ranges[local.cidr_names[pair[1]]].first < local.cidr_ranges[local.cidr_names[pair[0]]].first + local.cidr_ranges[local.cidr_names[pair[0]]].size
+  ]
+
   aks_inbound_rules = {
     "Allow-AppGateway-HTTP-HTTPS-Inbound" = {
       description                = "Only the Application Gateway subnet may reach the internal ingress on 80/443."
@@ -14,8 +49,8 @@ locals {
       direction                  = "Inbound"
       access                     = "Allow"
       protocol                   = "Tcp"
-      source_address_prefix      = var.agw_subnet_prefix
-      destination_address_prefix = var.aks_vnet_address_prefix
+      source_address_prefix      = local.agw_subnet_cidr
+      destination_address_prefix = var.aks_vnet_cidr
       destination_port_ranges    = ["80", "443"]
     }
     "Deny-AppGateway-Other-Inbound" = {
@@ -24,7 +59,7 @@ locals {
       direction                  = "Inbound"
       access                     = "Deny"
       protocol                   = "*"
-      source_address_prefix      = var.agw_vnet_address_prefix
+      source_address_prefix      = var.agw_vnet_cidr
       destination_address_prefix = "*"
       destination_port_ranges    = ["*"]
     }
@@ -58,15 +93,15 @@ locals {
   aks_subnets = {
     nodes = {
       name   = "${local.prefix}-snet-aks-nodes"
-      prefix = var.aks_node_subnet_prefix
+      prefix = local.aks_node_subnet_cidr
     }
     ingress = {
       name   = "${local.prefix}-snet-aks-ingress"
-      prefix = var.aks_ingress_subnet_prefix
+      prefix = local.aks_ingress_subnet_cidr
     }
     pe = {
       name   = "${local.prefix}-snet-pe"
-      prefix = var.aks_private_endpoint_subnet_prefix
+      prefix = local.aks_pe_subnet_cidr
     }
   }
 }
@@ -114,7 +149,7 @@ resource "azurerm_network_security_group" "agw" {
     protocol                   = "Tcp"
     source_address_prefix      = "Internet"
     source_port_range          = "*"
-    destination_address_prefix = var.agw_subnet_prefix
+    destination_address_prefix = local.agw_subnet_cidr
     destination_port_ranges    = ["80", "443"]
   }
 
@@ -186,8 +221,15 @@ resource "azurerm_virtual_network" "aks" {
   name                = "${local.prefix}-vnet-aks"
   location            = local.location
   resource_group_name = local.rg_name
-  address_space       = [var.aks_vnet_address_prefix]
+  address_space       = [var.aks_vnet_cidr]
   tags                = local.tags
+
+  lifecycle {
+    precondition {
+      condition     = length(local.cidr_overlaps) == 0
+      error_message = "Address ranges must not overlap: ${join("; ", local.cidr_overlaps)}"
+    }
+  }
 }
 
 resource "azurerm_subnet" "aks" {
@@ -217,7 +259,7 @@ resource "azurerm_virtual_network" "agw" {
   name                = "${local.prefix}-vnet-agw"
   location            = local.location
   resource_group_name = local.rg_name
-  address_space       = [var.agw_vnet_address_prefix]
+  address_space       = [var.agw_vnet_cidr]
   tags                = local.tags
 }
 
@@ -225,7 +267,7 @@ resource "azurerm_subnet" "agw" {
   name                 = "${local.prefix}-snet-agw"
   resource_group_name  = local.rg_name
   virtual_network_name = azurerm_virtual_network.agw.name
-  address_prefixes     = [var.agw_subnet_prefix]
+  address_prefixes     = [local.agw_subnet_cidr]
 }
 
 resource "azurerm_subnet_network_security_group_association" "agw" {
