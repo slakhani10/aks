@@ -21,6 +21,8 @@ This repo holds Terraform (azurerm provider 4.x) and a GitHub Actions workflow. 
                <rg>-natgw (outbound only) ──► allowed Azure service tags
 ```
 
+> 📐 **Diagrams:** see [`docs/architecture.md`](docs/architecture.md). It has a request flow, allowed and blocked traffic paths, a detailed network diagram with every security control marked (S1–S24), the deployment pipeline flow, and full NSG rule tables.
+
 ## What you provide
 
 | Input | Required | Default | Notes |
