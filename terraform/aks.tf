@@ -181,11 +181,30 @@ resource "azurerm_kubernetes_cluster_node_pool" "user" {
 }
 
 # ------------------------------------------- Container Insights (managed identity) --
+# Mirrors Microsoft's maintained Container Insights Terraform template
+# (https://aka.ms/enable-monitoring-msi-terraform): no "kind", explicit stream list.
+locals {
+  container_insights_streams = [
+    "Microsoft-ContainerLog",
+    "Microsoft-ContainerLogV2",
+    "Microsoft-KubeEvents",
+    "Microsoft-KubePodInventory",
+    "Microsoft-KubeNodeInventory",
+    "Microsoft-KubePVInventory",
+    "Microsoft-KubeServices",
+    "Microsoft-KubeMonAgentEvents",
+    "Microsoft-InsightsMetrics",
+    "Microsoft-ContainerInventory",
+    "Microsoft-ContainerNodeInventory",
+    "Microsoft-Perf",
+  ]
+}
+
 resource "azurerm_monitor_data_collection_rule" "container_insights" {
   name                = "MSCI-${local.location}-${local.aks_name}"
   location            = local.location
   resource_group_name = local.rg_name
-  kind                = "Linux"
+  description         = "DCR for Azure Monitor Container Insights"
   tags                = local.tags
 
   destinations {
@@ -196,7 +215,7 @@ resource "azurerm_monitor_data_collection_rule" "container_insights" {
   }
 
   data_flow {
-    streams      = ["Microsoft-ContainerInsights-Group-Default"]
+    streams      = local.container_insights_streams
     destinations = ["ciworkspace"]
   }
 
@@ -204,11 +223,12 @@ resource "azurerm_monitor_data_collection_rule" "container_insights" {
     extension {
       name           = "ContainerInsightsExtension"
       extension_name = "ContainerInsights"
-      streams        = ["Microsoft-ContainerInsights-Group-Default"]
+      streams        = local.container_insights_streams
       extension_json = jsonencode({
         dataCollectionSettings = {
           interval               = "1m"
-          namespaceFilteringMode = "Off"
+          namespaceFilteringMode = "Off" # collect from all namespaces
+          namespaces             = ["kube-system", "gatekeeper-system", "azure-arc"]
           enableContainerLogV2   = true
         }
       })

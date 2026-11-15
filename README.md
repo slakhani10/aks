@@ -200,7 +200,19 @@ az role assignment create --assignee "$APP_ID" --role "Network Contributor" \
   --scope /subscriptions/$SUB/resourceGroups/NetworkWatcherRG
 ```
 
-You can constrain `Role Based Access Control Administrator` with a condition that limits it to the roles this configuration assigns: Network Contributor, Key Vault Secrets User, and Azure Kubernetes Service RBAC Cluster Admin.
+You can constrain `Role Based Access Control Administrator` with a condition that limits it to the roles this configuration assigns: Network Contributor, Private DNS Zone Contributor, Key Vault Secrets User, and Azure Kubernetes Service RBAC Cluster Admin.
+
+**Let Terraform recover soft-deleted Key Vaults (recommended).** After a `destroy`, the Key Vault stays soft-deleted for 90 days under the same name. The provider is configured to *recover* it on the next `apply` (`recover_soft_deleted_key_vaults = true`), which keeps its secrets and lets purge protection stay on. To see deleted vaults, though, the deployment identity needs `Microsoft.KeyVault/locations/deletedVaults/read`, which exists only at **subscription** scope. Without it, `apply` fails with `409 … A vault with the same name already exists in deleted state`. This custom role grants only that read permission:
+
+```bash
+az role definition create --role-definition "{
+  \"Name\": \"Key Vault Deleted Vault Reader\",
+  \"Description\": \"Lets Terraform find soft-deleted Key Vaults so it can recover them.\",
+  \"Actions\": [\"Microsoft.KeyVault/locations/deletedVaults/read\"],
+  \"AssignableScopes\": [\"/subscriptions/$SUB\"]
+}"
+az role assignment create --assignee "$APP_ID" --role "Key Vault Deleted Vault Reader" --scope "/subscriptions/$SUB"
+```
 
 ### 4. One-time subscription prerequisites
 
