@@ -84,6 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
+        shell: bash # explicit bash = "-eo pipefail", so failures in pipes fail the step
         working-directory: ${{ env.WORKDIR }}
     steps:
       - uses: actions/checkout@v4
@@ -112,6 +113,7 @@ jobs:
     environment: azure-preview
     defaults:
       run:
+        shell: bash # explicit bash = "-eo pipefail", so failures in pipes fail the step
         working-directory: ${{ env.WORKDIR }}
     env:
       RG: ${{ inputs.resource_group }}
@@ -179,7 +181,26 @@ jobs:
         run: |
           DESTROY_FLAG=""
           if [ "${{ inputs.action }}" = "destroy" ]; then DESTROY_FLAG="-destroy"; fi
-          terraform plan $DESTROY_FLAG -out=tfplan -no-color | tee plan.txt
+
+          # Capture terraform's own exit code; piping into tee would otherwise hide failures.
+          set +e
+          terraform plan $DESTROY_FLAG -out=tfplan -no-color 2>&1 | tee plan.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            # Never hand an incomplete plan to the apply job.
+            rm -f tfplan
+            {
+              echo "## ❌ Terraform plan failed for \`$RG\`"
+              echo '```'
+              grep -A12 -E '^(Error|│ Error)' plan.txt | head -n 80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::terraform plan failed (exit $PLAN_EXIT). See the errors above or in the run summary."
+            exit "$PLAN_EXIT"
+          fi
+
           {
             echo "## Terraform plan (${{ inputs.action }}) for \`$RG\`"
             echo '```'
@@ -196,6 +217,7 @@ jobs:
           name: tfplan-${{ github.run_id }}
           path: ${{ env.WORKDIR }}/tfplan
           retention-days: 1
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   apply:
@@ -207,6 +229,7 @@ jobs:
     environment: azure-production
     defaults:
       run:
+        shell: bash # explicit bash = "-eo pipefail", so failures in pipes fail the step
         working-directory: ${{ env.WORKDIR }}
     env:
       RG: ${{ inputs.resource_group }}
