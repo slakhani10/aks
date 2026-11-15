@@ -29,10 +29,16 @@ resource "azurerm_private_dns_zone" "kv" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "kv" {
-  for_each = {
-    aks = azurerm_virtual_network.aks
-    agw = azurerm_virtual_network.agw
-  }
+  for_each = merge(
+    {
+      aks = { name = azurerm_virtual_network.aks.name, id = azurerm_virtual_network.aks.id }
+      agw = { name = azurerm_virtual_network.agw.name, id = azurerm_virtual_network.agw.id }
+    },
+    # Lets jobs on the private runner manage secrets/certificates in the private vault.
+    local.runner_enabled ? {
+      runner = { name = data.azurerm_virtual_network.runner[0].name, id = data.azurerm_virtual_network.runner[0].id }
+    } : {}
+  )
 
   name                 = "${each.value.name}-link"
   private_dns_zone_id  = azurerm_private_dns_zone.kv.id # azurerm 5.x: zone (and its RG) referenced by ID

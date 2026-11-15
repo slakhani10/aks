@@ -81,6 +81,18 @@ variable "network_watcher_resource_group" {
   default     = "NetworkWatcherRG"
 }
 
+variable "runner_vnet_name" {
+  description = <<-EOT
+    Optional name of the private GitHub runner vNet (created by ../runner, e.g.
+    "<rg>-vnet-runner") in the same resource group. When set, the AKS vNet is
+    peered with it, the runner may reach the AKS vNet on TCP 443 only (private
+    API server + Key Vault private endpoint), and the private DNS zones of the
+    API server and Key Vault are linked to it. Null = no runner connectivity.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "additional_tags" {
   description = "Optional extra tags added to every resource. Resource group tags are always copied and win on key conflicts."
   type        = map(string)

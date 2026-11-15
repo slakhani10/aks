@@ -4,12 +4,13 @@ These diagrams describe what [`terraform/`](../terraform) deploys. Addresses sho
 
 PNG exports of every diagram are in [`docs/images/`](images/) for use outside GitHub.
 
-Security controls are tagged **S1–S24** in the diagrams and explained in the [security specification catalogue](#security-specification-catalogue) at the end.
+Security controls are tagged **S1–S27** in the diagrams and explained in the [security specification catalogue](#security-specification-catalogue) at the end.
 
 * [1. End-user request flow](#1-end-user-request-flow)
 * [2. Allowed vs. blocked traffic paths](#2-allowed-vs-blocked-traffic-paths)
 * [3. Detailed network diagram](#3-detailed-network-diagram)
 * [4. Deployment & operations flow](#4-deployment--operations-flow)
+* [5. Private GitHub runner (optional)](#5-private-github-runner-optional)
 * [NSG rule reference](#nsg-rule-reference)
 * [Security specification catalogue](#security-specification-catalogue)
 
@@ -255,6 +256,49 @@ flowchart TB
 
 ---
 
+## 5. Private GitHub runner (optional)
+
+Created by [`runner/`](../runner) and [`deploy-runner.yml`](../.github/workflows/deploy-runner.yml) **before** the AKS workflow. When the AKS workflow runs with `runner = self-hosted`, its Plan/Apply jobs run here, and the AKS deployment adds the peering, NSG rules and DNS links shown in blue.
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 360}}}%%
+flowchart LR
+    classDef sec fill:#e8f0fe,stroke:#1a73e8,color:#0b2a5c
+    classDef nsg fill:#fce8e6,stroke:#d93025,color:#5c1410
+    classDef res fill:#ffffff,stroke:#5f6368,color:#202124
+    classDef pub fill:#fef7e0,stroke:#f9ab00,color:#3c2a00
+    classDef ext fill:#f1f3f4,stroke:#5f6368,color:#202124
+
+    GH(["GitHub · github.com"]):::ext
+    INET(["Internet"]):::ext
+
+    subgraph RG["Resource group #lt;rg#gt;"]
+        direction LR
+        subgraph RVNET["vnet-runner 10.2.0.0/26"]
+            subgraph RSUB["snet-runner 10.2.0.0/28"]
+                RNSG{{"#lt;rg#gt;-nsg-runner<br/>in: deny all<br/>out: 443/80 Internet only"}}:::nsg
+                VM["S25 #lt;rg#gt;-runner-01 … Ubuntu 24.04<br/>no public IP · Trusted Launch<br/>encryption at host · auto-patching<br/>runner service as unprivileged user"]:::sec
+            end
+        end
+        NAT["#lt;rg#gt;-natgw-runner<br/>outbound-only static IP"]:::pub
+        subgraph AVNET["vnet-aks 10.0.0.0/22"]
+            API["Private AKS API server :443"]:::sec
+            PEKV["Key Vault private endpoint :443"]:::sec
+        end
+        DNS["Private DNS zones<br/>privatelink.#lt;region#gt;.azmk8s.io<br/>privatelink.vaultcore.azure.net"]:::res
+    end
+
+    VM -->|"HTTPS long-poll for jobs<br/>(outbound only)"| NAT --> GH
+    NAT -.->|"other ports denied by NSG"| INET
+    VM ==>|"S27 peering · TCP 443 only"| API
+    VM ==> PEKV
+    DNS -.->|"linked to runner vNet"| RVNET
+```
+
+**Registration flow (S26):** `terraform apply` creates the VMs, and cloud-init installs the Azure CLI and tools and stages the runner. The workflow then requests a 1-hour registration token from the GitHub API with `RUNNER_ADMIN_TOKEN` and runs [`register-runner.sh`](../runner/scripts/register-runner.sh) on each VM through `az vm run-command`. Finally, it waits until GitHub reports every runner **online**. The runner only makes outbound connections to GitHub; nothing connects to it.
+
+---
+
 ## NSG rule reference
 
 ### `<rg>-nsg-agw` (App Gateway subnet)
@@ -274,6 +318,8 @@ Outbound uses the Azure defaults, which App Gateway v2 requires.
 |---|---|---|---|---|---|---|
 | 100 | Allow-AppGateway-HTTP-HTTPS-Inbound | In | App Gateway subnet | AKS vNet | TCP 80, 443 | Allow |
 | 110 | Deny-AppGateway-Other-Inbound | In | App Gateway vNet | * | * | **Deny** |
+| 120 | Allow-Runner-HTTPS-Inbound ¹ | In | Runner vNet | AKS vNet | TCP 443 | Allow |
+| 130 | Deny-Runner-Other-Inbound ¹ | In | Runner vNet | * | * | **Deny** |
 | 4000 | Deny-Internet-Inbound | In | Internet | * | * | **Deny** |
 | 100 | Allow-AzureActiveDirectory-443 | Out | * | AzureActiveDirectory | TCP 443 | Allow |
 | 110 | Allow-MicrosoftContainerRegistry-443 | Out | * | MicrosoftContainerRegistry | TCP 443 | Allow |
@@ -282,7 +328,20 @@ Outbound uses the Azure defaults, which App Gateway v2 requires.
 | 140 | Allow-AzureCloud-443 | Out | * | AzureCloud | TCP 443 | Allow |
 | 4000 | Deny-Internet-Outbound | Out | * | Internet | * | **Deny** |
 
+¹ Only present when the AKS deployment is connected to the private runner (`runner_vnet_name` set).
+
 The outbound rules come from [`terraform/config/aks-egress-rules.json`](../terraform/config/aks-egress-rules.json). Azure's built-in rules (AllowVnetInBound/OutBound, AllowAzureLoadBalancerInBound, priority 65000+) still apply. They keep intra-vNet, peered and private endpoint traffic working.
+
+### `<rg>-nsg-runner` (private runner subnet)
+
+| Prio | Name | Direction | Source | Destination | Ports | Action |
+|---|---|---|---|---|---|---|
+| 4096 | Deny-All-Inbound | In | * | * | * | **Deny** |
+| 100 | Allow-Internet-HTTPS | Out | * | Internet | TCP 443 | Allow |
+| 110 | Allow-Internet-HTTP | Out | * | Internet | TCP 80 | Allow (Ubuntu mirrors) |
+| 4000 | Deny-Internet-Outbound | Out | * | Internet | * | **Deny** |
+
+The outbound rules come from [`runner/config/runner-egress-rules.json`](../runner/config/runner-egress-rules.json).
 
 ---
 
@@ -303,7 +362,7 @@ The outbound rules come from [`terraform/config/aks-egress-rules.json`](../terra
 | S11 | Internal load balancers only | Azure Policy | Built-in `3fc4dc25…` with effect **deny** | Defense in depth |
 | S12 | Pod network policy | AKS | Cilium dataplane + network policy; sample app uses namespace default-deny | Defense in depth |
 | S13 | Pod security baseline | Azure Policy | Built-in initiative `a8640138…` with effect **deny** (system namespaces excluded) | Defense in depth |
-| S14 | Private API server | AKS | `private_cluster_enabled`, no public FQDN, system-managed private DNS zone | 8 (AKS) |
+| S14 | Private API server | AKS | `private_cluster_enabled`, no public FQDN; private DNS zone `privatelink.<region>.azmk8s.io` in the resource group, linked to the AKS vNet (and the runner vNet when connected) | 8 (AKS) |
 | S15 | Identity & RBAC | AKS | Entra ID integration, Azure RBAC for Kubernetes, local accounts disabled; admins via Entra groups | 8 (RBAC on AKS) |
 | S16 | Private Key Vault | Key Vault + `<rg>-pe-kv` | Public network access disabled; private endpoint; private DNS linked to both vNets | 8 (Key Vault private endpoints) |
 | S17 | Key Vault hardening | Key Vault | RBAC authorization; soft delete 90 days; purge protection; least-privilege roles | 8 (recoverable, RBAC) |
@@ -314,3 +373,6 @@ The outbound rules come from [`terraform/config/aks-egress-rules.json`](../terra
 | S22 | Network flow logs | Network Watcher | Optional VNet flow logs, 365-day retention, Traffic Analytics; hardened storage account | 6.4 – 6.6 |
 | S23 | Secretless, gated pipeline | GitHub Actions | OIDC federation (no client secrets); RG-scoped roles; saved-plan apply behind required reviewers | 1 IAM (least privilege) |
 | S24 | Consistent tagging | all taggable resources | Resource group tags copied verbatim; AKS propagates them to its node resource group | Governance |
+| S25 | Private self-hosted runner | `runner/` | No public IP, all inbound denied, egress only 443/80 via NAT Gateway; Trusted Launch, encryption at host, platform patching, no password login; no Azure identity on the VM | 6 Networking · 7 Virtual Machines |
+| S26 | Secret-free runner registration | `deploy-runner.yml` | 1-hour GitHub registration token requested per run and passed via `az vm run-command`; never in Terraform state, plan artifacts or the VM model | 1 IAM |
+| S27 | Least-privilege runner reach | AKS NSG + peering | Runner vNet → AKS vNet on TCP 443 only (API server, Key Vault endpoint); everything else from the runner vNet denied; private DNS zones linked so names resolve privately | 6 Networking |

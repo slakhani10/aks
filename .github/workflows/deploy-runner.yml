@@ -1,0 +1,330 @@
+name: Deploy private GitHub runner
+
+# Run this BEFORE "Deploy secure AKS environment" when you want the AKS workflow
+# to execute on a self-hosted runner inside a private vNet (runner = self-hosted).
+# This workflow itself always runs on GitHub-hosted runners (bootstrap).
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Existing resource group (same one as the AKS environment)"
+        required: true
+        type: string
+      runner_vnet_cidr:
+        description: "Runner vNet CIDR (/16-/28). Must not overlap the AKS / App Gateway / pod / service ranges"
+        required: true
+        default: "10.2.0.0/26"
+        type: string
+      runner_vm_size:
+        description: "Runner VM SKU (Gen2 / Trusted Launch capable)"
+        required: true
+        default: "Standard_D2s_v5"
+        type: string
+      runner_count:
+        description: "Number of runner VMs (1-11)"
+        required: true
+        default: 1
+        type: number
+      action:
+        description: "plan = preview only, apply = deploy + register runners, destroy = remove VMs and unregister runners"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+  pull_request:
+    paths:
+      - "runner/**"
+      - ".github/workflows/deploy-runner.yml"
+
+permissions:
+  contents: read
+  id-token: write # OIDC federation to Entra ID - no client secrets stored in GitHub
+
+concurrency:
+  group: runner-${{ inputs.resource_group || github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.13.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  WORKDIR: runner
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: fmt & validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: terraform test (offline, mocked provider)
+        run: terraform test
+
+      - name: Registration script syntax
+        run: bash -n scripts/register-runner.sh
+
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    if: github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    environment: azure-preview
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      RG: ${{ inputs.resource_group }}
+      TF_VAR_resource_group_name: ${{ inputs.resource_group }}
+      TF_VAR_runner_vnet_cidr: ${{ inputs.runner_vnet_cidr }}
+      TF_VAR_runner_vm_size: ${{ inputs.runner_vm_size }}
+      TF_VAR_runner_count: ${{ inputs.runner_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check prerequisites
+        env:
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          if [ "$(az group exists --name "$RG")" != "true" ]; then
+            echo "::error::Resource group '$RG' does not exist. This workflow never creates resource groups."
+            exit 1
+          fi
+          if [ "${{ inputs.action }}" != "plan" ] && [ -z "$RUNNER_ADMIN_TOKEN" ]; then
+            echo "::error::Secret RUNNER_ADMIN_TOKEN is not set. It is needed to register/unregister runners (see README → Private GitHub runner)."
+            exit 1
+          fi
+
+      - name: Check encryption-at-host feature
+        run: |
+          STATE=$(az feature show --namespace Microsoft.Compute --name EncryptionAtHost \
+                    --query properties.state -o tsv 2>/dev/null || echo "Unknown")
+          case "$STATE" in
+            Registered) echo "TF_VAR_enable_encryption_at_host=true" >> "$GITHUB_ENV" ;;
+            Unknown)    echo "::notice::Cannot read EncryptionAtHost feature state (insufficient permissions?). Assuming it is registered."
+                        echo "TF_VAR_enable_encryption_at_host=true" >> "$GITHUB_ENV" ;;
+            *)          echo "::warning::Microsoft.Compute/EncryptionAtHost is '$STATE'. Deploying WITHOUT encryption at host."
+                        echo "TF_VAR_enable_encryption_at_host=false" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RG}-runner.tfstate"
+
+      - name: terraform plan
+        run: |
+          DESTROY_FLAG=""
+          if [ "${{ inputs.action }}" = "destroy" ]; then DESTROY_FLAG="-destroy"; fi
+
+          set +e
+          terraform plan $DESTROY_FLAG -out=tfplan -no-color 2>&1 | tee plan.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            rm -f tfplan
+            {
+              echo "## ❌ Terraform plan failed for \`$RG\` (runner)"
+              echo '```'
+              grep -A12 -E '^(Error|│ Error)' plan.txt | head -n 80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::terraform plan failed (exit $PLAN_EXIT). See the errors above or in the run summary."
+            exit "$PLAN_EXIT"
+          fi
+
+          {
+            echo "## Terraform plan (${{ inputs.action }}) for \`$RG\` runner"
+            echo '```'
+            grep -E '^(Plan:|No changes|  # )' plan.txt | tail -n 80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan
+        if: inputs.action != 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-runner-${{ github.run_id }}
+          path: ${{ env.WORKDIR }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply
+    if: github.event_name == 'workflow_dispatch' && inputs.action != 'plan'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: azure-production
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      RG: ${{ inputs.resource_group }}
+      GH_API: ${{ github.api_url }}/repos/${{ github.repository }}/actions/runners
+      REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-runner-${{ github.run_id }}
+          path: ${{ env.WORKDIR }}
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RG}-runner.tfstate"
+
+      # Capture the runner names before a destroy removes them from state.
+      - name: Read runner names
+        id: before
+        run: |
+          NAMES=$(terraform output -json runner_vm_names 2>/dev/null || echo '[]')
+          echo "names=$(echo "$NAMES" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: terraform apply
+        run: terraform apply -no-color tfplan
+
+      - name: Register runners with GitHub
+        if: inputs.action == 'apply'
+        env:
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          LABELS=$(terraform output -raw runner_labels)
+          mapfile -t NAMES < <(terraform output -json runner_vm_names | jq -r '.[]')
+
+          for NAME in "${NAMES[@]}"; do
+            # Short-lived (1 h) registration token; masked and never written to disk or state.
+            TOKEN=$(curl -fsSL -X POST \
+                      -H "Authorization: Bearer $RUNNER_ADMIN_TOKEN" \
+                      -H "Accept: application/vnd.github+json" \
+                      "$GH_API/registration-token" | jq -r .token)
+            echo "::add-mask::$TOKEN"
+            if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+              echo "::error::Could not obtain a runner registration token. Check that RUNNER_ADMIN_TOKEN has 'Administration: Read and write' on this repository."
+              exit 1
+            fi
+
+            echo "Registering $NAME (labels: $LABELS)"
+            OUT=$(az vm run-command invoke -g "$RG" -n "$NAME" \
+                    --command-id RunShellScript \
+                    --scripts @scripts/register-runner.sh \
+                    --parameters "$REPO_URL" "$TOKEN" "$NAME" "$LABELS" \
+                    --query 'value[0].message' -o tsv)
+            echo "$OUT"
+            if ! echo "$OUT" | grep -q 'RUNNER_READY'; then
+              echo "::error::Registration of $NAME failed (see the script output above)"
+              exit 1
+            fi
+          done
+
+      - name: Wait for runners to come online
+        if: inputs.action == 'apply'
+        env:
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t NAMES < <(terraform output -json runner_vm_names | jq -r '.[]')
+          for attempt in $(seq 1 20); do
+            RUNNERS=$(curl -fsSL -H "Authorization: Bearer $RUNNER_ADMIN_TOKEN" \
+                        -H "Accept: application/vnd.github+json" "$GH_API?per_page=100")
+            OFFLINE=0
+            for NAME in "${NAMES[@]}"; do
+              STATUS=$(echo "$RUNNERS" | jq -r --arg n "$NAME" '.runners[] | select(.name == $n) | .status')
+              echo "$NAME: ${STATUS:-not registered}"
+              [ "$STATUS" = "online" ] || OFFLINE=1
+            done
+            if [ "$OFFLINE" -eq 0 ]; then
+              {
+                echo "## Runners online for \`$RG\`"
+                echo "Labels: \`$(terraform output -raw runner_labels)\`"
+                echo
+                echo "Run **Deploy secure AKS environment** with \`runner = self-hosted\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Runners did not come online. Check /var/log/cloud-init-output.log via 'az vm run-command invoke'."
+          exit 1
+
+      - name: Unregister runners from GitHub
+        if: inputs.action == 'destroy'
+        env:
+          RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+          NAMES: ${{ steps.before.outputs.names }}
+        run: |
+          set -euo pipefail
+          RUNNERS=$(curl -fsSL -H "Authorization: Bearer $RUNNER_ADMIN_TOKEN" \
+                      -H "Accept: application/vnd.github+json" "$GH_API?per_page=100")
+          for NAME in $(echo "$NAMES" | jq -r '.[]'); do
+            ID=$(echo "$RUNNERS" | jq -r --arg n "$NAME" '.runners[] | select(.name == $n) | .id')
+            if [ -n "$ID" ]; then
+              curl -fsSL -X DELETE -H "Authorization: Bearer $RUNNER_ADMIN_TOKEN" \
+                -H "Accept: application/vnd.github+json" "$GH_API/$ID"
+              echo "Removed runner $NAME ($ID)"
+            else
+              echo "Runner $NAME not registered; nothing to remove"
+            fi
+          done

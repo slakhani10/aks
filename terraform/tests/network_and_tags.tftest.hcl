@@ -28,6 +28,15 @@ variables {
   resource_group_name = "rg-shop-prod"
 }
 
+# AKS validates private_dns_zone_id as a real resource ID even at plan time.
+override_resource {
+  target          = azurerm_private_dns_zone.aks_api
+  override_during = plan
+  values = {
+    id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-shop-prod/providers/Microsoft.Network/privateDnsZones/privatelink.eastus2.azmk8s.io"
+  }
+}
+
 run "default_cidrs" {
   command = plan
 

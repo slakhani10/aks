@@ -6,7 +6,18 @@
 # filtered by the NSG egress rules in config/aks-egress-rules.json.
 # -----------------------------------------------------------------------------
 
+# ------------------------------------------------ Optional private runner --
+data "azurerm_virtual_network" "runner" {
+  count = local.runner_enabled ? 1 : 0
+
+  name                = var.runner_vnet_name
+  resource_group_name = local.rg_name
+}
+
 locals {
+  runner_enabled     = var.runner_vnet_name != null && var.runner_vnet_name != ""
+  runner_vnet_ranges = local.runner_enabled ? data.azurerm_virtual_network.runner[0].address_space : []
+
   # --------------------------------------------- Subnets derived from inputs --
   aks_vnet_bits = tonumber(split("/", var.aks_vnet_cidr)[1])
   agw_vnet_bits = tonumber(split("/", var.agw_vnet_cidr)[1])
@@ -21,12 +32,12 @@ locals {
   # ------------------------------------------------- Overlap detection --------
   # [first, last] address of each range as integers.
   cidr_ranges = {
-    for name, cidr in {
+    for name, cidr in merge({
       aks_vnet = var.aks_vnet_cidr
       agw_vnet = var.agw_vnet_cidr
       pod      = var.pod_cidr
       service  = var.service_cidr
-      } : name => {
+      }, { for i, c in local.runner_vnet_ranges : "runner_vnet_${i}" => c }) : name => {
       cidr  = cidr
       first = sum([for i, o in split(".", cidrhost(cidr, 0)) : tonumber(o) * pow(256, 3 - i)])
       size  = pow(2, 32 - tonumber(split("/", cidr)[1]))
@@ -75,6 +86,29 @@ locals {
     }
   }
 
+  runner_inbound_rules = local.runner_enabled ? {
+    "Allow-Runner-HTTPS-Inbound" = {
+      description                = "Private GitHub runner: TCP 443 only (private AKS API server, Key Vault private endpoint)."
+      priority                   = 120
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_address_prefix      = local.runner_vnet_ranges[0]
+      destination_address_prefix = var.aks_vnet_cidr
+      destination_port_ranges    = ["443"]
+    }
+    "Deny-Runner-Other-Inbound" = {
+      description                = "Block any other traffic from the peered runner vNet."
+      priority                   = 130
+      direction                  = "Inbound"
+      access                     = "Deny"
+      protocol                   = "*"
+      source_address_prefix      = local.runner_vnet_ranges[0]
+      destination_address_prefix = "*"
+      destination_port_ranges    = ["*"]
+    }
+  } : {}
+
   aks_outbound_rules = {
     for r in local.egress_rules : r.name => {
       description                = try(r.description, "")
@@ -88,7 +122,7 @@ locals {
     }
   }
 
-  aks_nsg_rules = merge(local.aks_inbound_rules, local.aks_outbound_rules)
+  aks_nsg_rules = merge(local.aks_inbound_rules, local.runner_inbound_rules, local.aks_outbound_rules)
 
   aks_subnets = {
     nodes = {
@@ -291,6 +325,32 @@ resource "azurerm_virtual_network_peering" "agw_to_aks" {
   name                         = "peer-to-${azurerm_virtual_network.aks.name}"
   resource_group_name          = local.rg_name
   virtual_network_name         = azurerm_virtual_network.agw.name
+  remote_virtual_network_id    = azurerm_virtual_network.aks.id
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = false
+  allow_gateway_transit        = false
+  use_remote_gateways          = false
+}
+
+resource "azurerm_virtual_network_peering" "aks_to_runner" {
+  count = local.runner_enabled ? 1 : 0
+
+  name                         = "peer-to-${var.runner_vnet_name}"
+  resource_group_name          = local.rg_name
+  virtual_network_name         = azurerm_virtual_network.aks.name
+  remote_virtual_network_id    = data.azurerm_virtual_network.runner[0].id
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = false
+  allow_gateway_transit        = false
+  use_remote_gateways          = false
+}
+
+resource "azurerm_virtual_network_peering" "runner_to_aks" {
+  count = local.runner_enabled ? 1 : 0
+
+  name                         = "peer-to-${azurerm_virtual_network.aks.name}"
+  resource_group_name          = local.rg_name
+  virtual_network_name         = var.runner_vnet_name
   remote_virtual_network_id    = azurerm_virtual_network.aks.id
   allow_virtual_network_access = true
   allow_forwarded_traffic      = false

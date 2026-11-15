@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars for local runs. The GitHub workflow passes these as TF_VAR_* instead.
+resource_group_name = "rg-shop-prod" # must already exist (same RG as the AKS environment)
+
+runner_vnet_cidr = "10.2.0.0/26" # /16 - /28; must not overlap the AKS / App Gateway / pod / service ranges
+runner_vm_size   = "Standard_D2s_v5"
+runner_count     = 1
+
+# Optional
+# runner_version            = "latest"
+# enable_encryption_at_host = true
+# additional_tags           = { owner = "platform-team" }

@@ -22,6 +22,43 @@ resource "azurerm_role_assignment" "aks_network_contributor" {
   skip_service_principal_aad_check = true
 }
 
+# Private DNS zone for the private API server. Kept in this resource group (rather
+# than AKS's "System" zone in the node resource group) so it can be linked to other
+# vNets - such as the private GitHub runner - with the deployment identity's
+# resource-group-scoped permissions.
+resource "azurerm_private_dns_zone" "aks_api" {
+  name                = "privatelink.${local.location}.azmk8s.io"
+  resource_group_name = local.rg_name
+  tags                = local.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "aks_api" {
+  name                 = "${azurerm_virtual_network.aks.name}-link"
+  private_dns_zone_id  = azurerm_private_dns_zone.aks_api.id
+  virtual_network_id   = azurerm_virtual_network.aks.id
+  registration_enabled = false
+  tags                 = local.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "aks_api_runner" {
+  count = local.runner_enabled ? 1 : 0
+
+  name                 = "${var.runner_vnet_name}-link"
+  private_dns_zone_id  = azurerm_private_dns_zone.aks_api.id
+  virtual_network_id   = data.azurerm_virtual_network.runner[0].id
+  registration_enabled = false
+  tags                 = local.tags
+}
+
+# AKS writes the API server's A record into the zone.
+resource "azurerm_role_assignment" "aks_private_dns_contributor" {
+  scope                            = azurerm_private_dns_zone.aks_api.id
+  role_definition_name             = "Private DNS Zone Contributor"
+  principal_id                     = azurerm_user_assigned_identity.aks.principal_id
+  principal_type                   = "ServicePrincipal"
+  skip_service_principal_aad_check = true
+}
+
 resource "azurerm_kubernetes_cluster" "this" {
   name                = local.aks_name
   location            = local.location
@@ -35,7 +72,7 @@ resource "azurerm_kubernetes_cluster" "this" {
   # Private API server
   private_cluster_enabled             = true
   private_cluster_public_fqdn_enabled = false
-  private_dns_zone_id                 = "System"
+  private_dns_zone_id                 = azurerm_private_dns_zone.aks_api.id # in this RG (see below)
 
   # Identity & access (CIS: RBAC on AKS)
   local_account_disabled            = true
@@ -114,6 +151,8 @@ resource "azurerm_kubernetes_cluster" "this" {
 
   depends_on = [
     azurerm_role_assignment.aks_network_contributor,
+    azurerm_role_assignment.aks_private_dns_contributor,
+    azurerm_private_dns_zone_virtual_network_link.aks_api,
     azurerm_subnet_nat_gateway_association.aks_nodes,
     azurerm_subnet_network_security_group_association.aks,
     azurerm_nat_gateway_public_ip_association.this,

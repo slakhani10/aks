@@ -34,6 +34,7 @@ This repo holds Terraform (azurerm provider 5.x) and a GitHub Actions workflow. 
 | `user_node_count` | yes | `2` | Workload pool node count (0–1000) |
 | `aks_vnet_cidr` | yes | `10.0.0.0/22` | AKS vNet range, `/16`–`/23`. Subnets are derived from it (see below). |
 | `agw_vnet_cidr` | yes | `10.1.0.0/24` | App Gateway vNet range, `/16`–`/25` |
+| `runner` | yes | `github-hosted` | `self-hosted` runs Plan/Apply on the [private runner](#private-github-runner-optional-deploy-first) and peers its vNet |
 | `pod_cidr` | no | `10.244.0.0/16` | Overlay pod range, `/12`–`/20`. In the workflow: repository variable `AKS_POD_CIDR`. |
 | `service_cidr` | no | `172.16.0.0/16` | Kubernetes service range, `/12`–`/24`; DNS service = 10th address. In the workflow: repository variable `AKS_SERVICE_CIDR`. |
 
@@ -218,6 +219,51 @@ Terraform runs with `resource_provider_registrations = "none"`, because an ident
 
 Then run **Actions → Deploy secure AKS environment → Run workflow**.
 
+## Private GitHub runner (optional, deploy first)
+
+[`runner/`](runner) is a separate Terraform root, deployed by [`.github/workflows/deploy-runner.yml`](.github/workflows/deploy-runner.yml). It creates self-hosted GitHub Actions runner VMs inside a private vNet in the **same resource group**. Run it **before** the AKS workflow when you want the AKS Plan/Apply jobs to run inside your network instead of on GitHub-hosted runners.
+
+```
+<rg>-vnet-runner 10.2.0.0/26 ──peering (created by the AKS deployment)──► <rg>-vnet-aks
+└─ <rg>-snet-runner 10.2.0.0/28                                          ├─ private API server (443)
+   NSG <rg>-nsg-runner: deny ALL inbound                                 └─ Key Vault private endpoint (443)
+   egress: 443/80 to Internet via <rg>-natgw-runner, everything else denied
+   <rg>-runner-01 … Ubuntu 24.04, no public IP, Trusted Launch, encryption at host
+```
+
+| Workflow input | Default | Notes |
+|---|---|---|
+| `resource_group` | — | The same existing resource group as the AKS environment |
+| `runner_vnet_cidr` | `10.2.0.0/26` | `/16`–`/28`. The runner subnet is the first `/28` (11 IPs). It must not overlap the AKS, App Gateway, pod or service ranges; the AKS plan fails if it does. |
+| `runner_vm_size` | `Standard_D2s_v5` | Needs Gen2 / Trusted Launch support |
+| `runner_count` | `1` | 1–11 VMs: `<rg>-runner-01`, `-02`, … |
+| `action` | `plan` | `apply` deploys and registers the runners; `destroy` deletes the VMs and unregisters them from GitHub |
+
+**Security design**
+* No public IP and an NSG that denies all inbound traffic, so nothing on the Internet (or in peered vNets) can connect to the runner. Break-glass access is `az vm run-command invoke` or the serial console; no SSH is exposed.
+* Outbound only through a NAT Gateway, limited by [`runner/config/runner-egress-rules.json`](runner/config/runner-egress-rules.json) to HTTPS (GitHub, Azure, Terraform registry) and HTTP (Ubuntu mirrors). Everything else to the Internet is denied. As with AKS, NSGs can't filter by FQDN; for that, put Azure Firewall in front.
+* Trusted Launch (secure boot + vTPM), encryption at host, platform-managed OS patching, password login disabled, and the runner service runs as an unprivileged `runner` user.
+* The runner VMs have **no Azure identity or roles**. Jobs still sign in to Azure with the same GitHub OIDC credentials as GitHub-hosted runners.
+* **Registration token never stored.** Terraform only stages the runner software (cloud-init). The workflow then asks GitHub for a 1-hour registration token and registers each VM through `az vm run-command`, so the token is never in Terraform state, the plan artifact or the VM model.
+
+**What the AKS deployment adds when `runner = self-hosted`**
+
+The workflow sets `runner_vnet_name = <rg>-vnet-runner`, and the AKS Terraform then:
+* peers the AKS and runner vNets (no forwarded traffic, no gateway transit);
+* allows the runner vNet into the AKS vNet on **TCP 443 only** (private API server, Key Vault private endpoint) and denies everything else from it;
+* links the private API server's DNS zone (`privatelink.<region>.azmk8s.io`, kept in your resource group) and the Key Vault DNS zone to the runner vNet. From the runner, `kubectl` works against the private API, and you can import certificates into the private Key Vault.
+
+Keep `runner` the same on every AKS run. Switching back to `github-hosted` removes the peering and DNS links again.
+
+### Setup
+
+1. **Secret `RUNNER_ADMIN_TOKEN`**: a fine-grained personal access token (or GitHub App token) for this repository with **Administration: Read and write**. It is only used to request registration tokens and to unregister runners on destroy.
+2. The OIDC app, state storage, role assignments and environments from the AKS setup above are reused. The runner's state is stored as `<rg>-runner.tfstate`.
+3. Run **Actions → Deploy private GitHub runner** with `action = apply`. The run waits until every runner shows **online** under Settings → Actions → Runners.
+4. Run **Deploy secure AKS environment** with `runner = self-hosted`.
+
+> ⚠️ Self-hosted runners execute workflow code inside your network. Keep this repository **private**, or make sure pull requests from forks can't run on these runners. The workflows here only target the self-hosted runner from manual `workflow_dispatch` runs; pull-request jobs stay on GitHub-hosted runners.
+
 ## Operating the private cluster
 
 ```bash
@@ -225,7 +271,7 @@ Then run **Actions → Deploy secure AKS environment → Run workflow**.
 az aks command invoke -g $RG -n $RG-aks --command "kubectl get nodes -o wide"
 ```
 
-For interactive access, add a jumpbox or Azure Bastion in a peered vNet, or use a self-hosted runner inside the vNet. Admins come from `aks_admin_group_object_ids`, which are Entra ID groups granted *Azure Kubernetes Service RBAC Cluster Admin*.
+For interactive access from inside the network, use the [private GitHub runner](#private-github-runner-optional-deploy-first), or add a jumpbox / Azure Bastion in a peered vNet. Admins come from `aks_admin_group_object_ids`, which are Entra ID groups granted *Azure Kubernetes Service RBAC Cluster Admin*.
 
 ## Exposing your applications
 
@@ -245,7 +291,7 @@ The App Gateway forwards the client's `Host` header, so host-based ingress rules
 
 ### HTTPS
 
-1. Import a PFX certificate into the environment's Key Vault. The vault is private, so do this from inside the vNet, or temporarily allow your IP.
+1. Import a PFX certificate into the environment's Key Vault. The vault is private, so do this from inside the network (for example a workflow job on the [private runner](#private-github-runner-optional-deploy-first)), or temporarily allow your IP.
 2. Re-apply with `app_gateway_certificate_kv_uri = "https://<vault>.vault.azure.net/secrets/<cert-name>"`. Use the versionless URI so the certificate rotates automatically.
 
 The App Gateway identity `<rg>-id-agw` already has `Key Vault Secrets User` on the vault. The deployment adds an HTTPS listener and a permanent HTTP→HTTPS redirect.
@@ -268,8 +314,16 @@ terraform/
   terraform.tfvars.example
   tests/                        # offline `terraform test` suite (mocked provider)
   .terraform.lock.hcl           # pinned provider version (azurerm 5.13.0)
+runner/                         # separate Terraform root: private GitHub runner
+  main.tf                       # runner vNet, NSG, NAT GW, VMs (Trusted Launch)
+  variables.tf  outputs.tf  providers.tf
+  cloud-init.yaml.tftpl         # installs Azure CLI + tools, stages the runner
+  scripts/register-runner.sh    # run on the VM via az vm run-command
+  config/runner-egress-rules.json
+  tests/                        # offline `terraform test` suite
 k8s/sample-app.yaml             # smoke-test app on the internal LB
 .github/workflows/deploy-aks.yml
+.github/workflows/deploy-runner.yml
 ```
 
 ## Local usage

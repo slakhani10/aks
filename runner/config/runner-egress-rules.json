@@ -1,0 +1,29 @@
+[
+  {
+    "name": "Allow-Internet-HTTPS",
+    "description": "GitHub (github.com, *.actions.githubusercontent.com), Azure ARM/Entra ID, Terraform registry, package feeds.",
+    "priority": 100,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "Internet",
+    "destinationPortRanges": ["443"],
+    "access": "Allow"
+  },
+  {
+    "name": "Allow-Internet-HTTP",
+    "description": "Ubuntu package mirrors (azure.archive.ubuntu.com) are served over HTTP with signed packages.",
+    "priority": 110,
+    "protocol": "Tcp",
+    "destinationAddressPrefix": "Internet",
+    "destinationPortRanges": ["80"],
+    "access": "Allow"
+  },
+  {
+    "name": "Deny-Internet-Outbound",
+    "description": "Block all other Internet egress. vNet and peered-vNet traffic is still allowed by the default AllowVnetOutBound rule.",
+    "priority": 4000,
+    "protocol": "*",
+    "destinationAddressPrefix": "Internet",
+    "destinationPortRanges": ["*"],
+    "access": "Deny"
+  }
+]
