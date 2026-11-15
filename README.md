@@ -155,15 +155,20 @@ SUB=$(az account show --query id -o tsv)
 
 APP_ID=$(az ad app create --display-name "gh-${RG}-deployer" --query appId -o tsv)
 az ad sp create --id "$APP_ID"
-
-for ENV in azure-preview azure-production; do
+ENV=azure-preview
   az ad app federated-credential create --id "$APP_ID" --parameters "{
     \"name\": \"gh-${ENV}\",
     \"issuer\": \"https://token.actions.githubusercontent.com\",
     \"subject\": \"repo:${REPO}:environment:${ENV}\",
     \"audiences\": [\"api://AzureADTokenExchange\"]
   }"
-done
+ENV=azure-production
+  az ad app federated-credential create --id "$APP_ID" --parameters "{
+    \"name\": \"gh-${ENV}\",
+    \"issuer\": \"https://token.actions.githubusercontent.com\",
+    \"subject\": \"repo:${REPO}:environment:${ENV}\",
+    \"audiences\": [\"api://AzureADTokenExchange\"]
+  }"
 ```
 
 ### 2. Create the Terraform state storage (once)

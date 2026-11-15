@@ -7,7 +7,7 @@ variable "resource_group_name" {
 variable "system_node_vm_size" {
   description = "VM SKU for the system node pool."
   type        = string
-  default     = "Standard_D4ds_v5"
+  default     = "Standard_B2as_v2"
 }
 
 variable "system_node_count" {
@@ -113,13 +113,13 @@ variable "log_retention_days" {
 variable "app_gateway_min_capacity" {
   description = "App Gateway autoscale minimum instances."
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "app_gateway_max_capacity" {
   description = "App Gateway autoscale maximum instances (must fit in the App Gateway subnet)."
   type        = number
-  default     = 10
+  default     = 2
 }
 
 # ------------------------------------------------------------ Address space ----

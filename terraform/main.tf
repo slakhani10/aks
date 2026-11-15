@@ -29,7 +29,7 @@ locals {
   alnum_prefix       = replace(local.prefix, "/[^a-z0-9]/", "")
   short_alnum_prefix = substr(local.alnum_prefix, 0, min(length(local.alnum_prefix), 13))
   unique_suffix      = substr(sha1(data.azurerm_resource_group.this.id), 0, 8)
-  key_vault_name     = "${local.short_alnum_prefix}kv${local.unique_suffix}"
+  key_vault_name     = "${local.short_alnum_prefix}kvlt${local.unique_suffix}"
   flowlog_sa_name    = "${local.short_alnum_prefix}fl${local.unique_suffix}"
 
   aks_name          = "${local.prefix}-aks"
