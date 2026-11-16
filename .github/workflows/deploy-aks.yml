@@ -167,10 +167,30 @@ jobs:
           if [ -n "$POD_CIDR" ];     then echo "TF_VAR_pod_cidr=$POD_CIDR"         >> "$GITHUB_ENV"; fi
           if [ -n "$SERVICE_CIDR" ]; then echo "TF_VAR_service_cidr=$SERVICE_CIDR" >> "$GITHUB_ENV"; fi
 
+      # Private DNS zones for ACR and PostgreSQL private endpoints (created locally
+      # or looked up centrally, and linked to the AKS / runner vNets). Defaults:
+      # privatelink.azurecr.io and privatelink.postgres.database.azure.com.
+      # Repository variables ACR_/POSTGRES_PRIVATE_DNS_ZONE_NAME override a name;
+      # set one to "none" to skip that zone.
+      - name: Service private DNS zone names (repository variables)
+        env:
+          ACR_ZONE: ${{ vars.ACR_PRIVATE_DNS_ZONE_NAME }}
+          PG_ZONE: ${{ vars.POSTGRES_PRIVATE_DNS_ZONE_NAME }}
+        run: |
+          for pair in "acr:$ACR_ZONE" "postgres:$PG_ZONE"; do
+            key="${pair%%:*}"; zone="${pair#*:}"
+            case "$zone" in
+              "")   ;;
+              none) echo "TF_VAR_${key}_private_dns_zone_name=" >> "$GITHUB_ENV"; echo "Skipping the $key private DNS zone" ;;
+              *)    echo "TF_VAR_${key}_private_dns_zone_name=$zone" >> "$GITHUB_ENV" ;;
+            esac
+          done
+
       # Optional: use and link CENTRAL private DNS zones (e.g. from "Deploy central
       # private DNS zones") instead of creating them in this resource group.
       # Zone names: privatelink.vaultcore.azure.net and privatelink.<region>.azmk8s.io,
-      # overridable with repository variables KV_/AKS_PRIVATE_DNS_ZONE_NAME.
+      # overridable with repository variables KV_/AKS_PRIVATE_DNS_ZONE_NAME, plus the
+      # ACR / PostgreSQL zones above - all must exist in the central resource group.
       - name: Central private DNS zones
         if: inputs.central_dns_zones != ''
         working-directory: .

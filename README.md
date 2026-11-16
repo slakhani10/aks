@@ -243,7 +243,7 @@ Terraform runs with `resource_provider_registrations = "none"`, because an ident
 ### 5. Configure GitHub
 
 * **Secrets**: `AZURE_CLIENT_ID` (= `$APP_ID`), `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
-* **Variables**: `TFSTATE_RESOURCE_GROUP`, `TFSTATE_STORAGE_ACCOUNT`, `TFSTATE_CONTAINER` (optional, default `tfstate`), and optionally `AKS_POD_CIDR` / `AKS_SERVICE_CIDR`
+* **Variables**: `TFSTATE_RESOURCE_GROUP`, `TFSTATE_STORAGE_ACCOUNT`, `TFSTATE_CONTAINER` (optional, default `tfstate`), and optionally `AKS_POD_CIDR` / `AKS_SERVICE_CIDR` and the DNS zone names (`KV_` / `AKS_` / `ACR_` / `POSTGRES_PRIVATE_DNS_ZONE_NAME`)
 * **Environments**: `azure-preview` and `azure-production`. Add required reviewers on `azure-production`.
 
 Then run **Actions → Deploy secure AKS environment → Run workflow**.
@@ -295,12 +295,25 @@ Keep `runner` the same on every AKS run. Switching back to `github-hosted` remov
 
 ## Central private DNS zones (optional)
 
-By default each environment creates its own `privatelink.vaultcore.azure.net` and `privatelink.<region>.azmk8s.io` zones in its resource group. To use **central zones**, for example in a hub or shared-services subscription:
+By default each environment creates its own private DNS zones in its resource group:
+
+| Zone | Used by |
+|---|---|
+| `privatelink.vaultcore.azure.net` | The environment's Key Vault private endpoint |
+| `privatelink.<region>.azmk8s.io` | The private AKS API server |
+| `privatelink.azurecr.io` | Azure Container Registry private endpoints, including the `<registry>.<region>.data` data-endpoint records |
+| `privatelink.postgres.database.azure.com` | Azure Database for PostgreSQL flexible server private endpoints |
+
+The ACR and PostgreSQL zones are **prepared for workloads**: this environment doesn't deploy a registry or a database. When you add a private endpoint for one, put it in the `pe` subnet (or any subnet that can reach it) and point its `private_dns_zone_group` at the zone ID from the Terraform output `private_dns_zone_ids` (`acr` / `postgres`). Pods and the private runner then resolve `<name>.azurecr.io` / `<name>.postgres.database.azure.com` to the private IP. Pods reach the endpoints on any port. The private runner reaches the AKS vNet on TCP 443 only, so it can pull from or push to a private ACR. Running database jobs on the runner, such as migrations, needs an extra `Allow` rule for TCP 5432 in `terraform/network.tf`. To rename a zone, set the repository variable `ACR_PRIVATE_DNS_ZONE_NAME` / `POSTGRES_PRIVATE_DNS_ZONE_NAME`. To skip a zone, set the variable to `none`.
+
+> ℹ️ The PostgreSQL zone is for servers with **public access + private endpoint** (the recommended Private Link model). A server with **private access (VNet integration)** is injected into a delegated subnet and needs its own zone whose name ends in `postgres.database.azure.com` and isn't the server name, for example `<rg>.private.postgres.database.azure.com`. It isn't covered here.
+
+To use **central zones**, for example in a hub or shared-services subscription:
 
 1. **Create the zones once** with **Deploy central private DNS zones** ([`deploy-dns-zones.yml`](.github/workflows/deploy-dns-zones.yml), Terraform [`dns-zones/`](dns-zones)).
    * Inputs: `subscription` (name or ID), an **existing** `resource_group`, and `aks_region` (empty = the RG's region).
-   * It creates both zones with the resource group's tags.
-2. **Deploy the environment** with **Deploy secure AKS environment** and set the input **`central_dns_zones`** = `<subscription name or ID>/<resource group>`, for example `Hub Subscription/rg-dns-hub`. Leave it empty for local zones. The AKS Terraform ([`terraform/dns.tf`](terraform/dns.tf)) then looks up both zone IDs by name in that subscription and:
+   * It creates all four zones with the resource group's tags.
+2. **Deploy the environment** with **Deploy secure AKS environment** and set the input **`central_dns_zones`** = `<subscription name or ID>/<resource group>`, for example `Hub Subscription/rg-dns-hub`. Leave it empty for local zones. The AKS Terraform ([`terraform/dns.tf`](terraform/dns.tf)) then looks up the zone IDs by name in that subscription and:
    * uses the API zone for the private cluster and grants the cluster identity *Private DNS Zone Contributor* on it;
    * registers the Key Vault private endpoint record in the Key Vault zone;
    * creates the vNet links in the DNS subscription:
@@ -308,9 +321,11 @@ By default each environment creates its own `privatelink.vaultcore.azure.net` an
 | Zone | Linked vNets |
 |---|---|
 | `privatelink.vaultcore.azure.net` | `<rg>-vnet-aks`, `<rg>-vnet-runner` (when `runner = self-hosted`) |
+| `privatelink.azurecr.io` | `<rg>-vnet-aks`, `<rg>-vnet-runner` (when `runner = self-hosted`) |
+| `privatelink.postgres.database.azure.com` | `<rg>-vnet-aks`, `<rg>-vnet-runner` (when `runner = self-hosted`) |
 | `privatelink.<region>.azmk8s.io` | `<rg>-vnet-runner` (when `runner = self-hosted`). AKS [links its own vNet](https://learn.microsoft.com/azure/aks/private-clusters#hub-and-spoke-with-custom-dns-for-private-aks-clusters) when it uses a custom zone; a second link would conflict. |
 
-The zone names default to the standard ones. The API zone name must match the cluster's region, and the plan fails otherwise. To override the names, set the repository variables `KV_PRIVATE_DNS_ZONE_NAME` / `AKS_PRIVATE_DNS_ZONE_NAME`. Destroying the environment also removes its links; the zones themselves stay.
+The zone names default to the standard ones. The API zone name must match the cluster's region, and the plan fails otherwise. To override the names, set the repository variables `KV_PRIVATE_DNS_ZONE_NAME` / `AKS_PRIVATE_DNS_ZONE_NAME` / `ACR_PRIVATE_DNS_ZONE_NAME` / `POSTGRES_PRIVATE_DNS_ZONE_NAME`. Every zone that isn't skipped must exist in the central resource group. If yours were created by an earlier version of the DNS zones workflow, re-run it with `action = apply` to add the ACR and PostgreSQL zones. Destroying the environment also removes its links; the zones themselves stay.
 
 > ⚠️ A cluster's private DNS zone can't be changed after creation. Switching an **existing** environment between local and central zones (or to other central zones) recreates the cluster, so destroy it first. Use the same `central_dns_zones` value on every run.
 

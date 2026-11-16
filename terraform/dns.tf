@@ -1,5 +1,7 @@
 # -----------------------------------------------------------------------------
-# Private DNS for the private API server and the Key Vault private endpoint.
+# Private DNS for the private API server, the Key Vault private endpoint and the
+# service zones (Azure Container Registry, PostgreSQL flexible server) used by
+# private endpoints that workloads add later.
 #
 # Two modes:
 #   * Local (default): both zones are created in this resource group and linked to
@@ -8,8 +10,9 @@
 #     the zones live in another subscription) to use EXISTING zones, e.g. created by
 #     ../dns-zones. They are looked up by name and linked from here, in the DNS
 #     subscription (provider alias "dns"):
-#       Key Vault zone  <- AKS vNet, runner vNet (if connected)
-#       AKS API zone    <- runner vNet (if connected)
+#       Key Vault zone        <- AKS vNet, runner vNet (if connected)
+#       ACR / PostgreSQL zones <- AKS vNet, runner vNet (if connected)
+#       AKS API zone          <- runner vNet (if connected)
 #     AKS links its own vNet to the API zone (documented AKS behaviour for custom
 #     zones), so that link is not created here - a second one would conflict.
 #
@@ -24,6 +27,34 @@ locals {
 
   kv_dns_zone_id  = local.central_dns ? data.azurerm_private_dns_zone.kv_central[0].id : azurerm_private_dns_zone.kv[0].id
   aks_dns_zone_id = local.central_dns ? data.azurerm_private_dns_zone.aks_api_central[0].id : azurerm_private_dns_zone.aks_api[0].id
+
+  # Service zones (key => zone name); empty names are skipped.
+  service_dns_zone_names = {
+    for k, v in {
+      acr      = var.acr_private_dns_zone_name
+      postgres = var.postgres_private_dns_zone_name
+    } : k => v if v != null && v != ""
+  }
+
+  # vNets that must resolve the service zones.
+  dns_linked_vnets = merge(
+    { aks = { name = azurerm_virtual_network.aks.name, id = azurerm_virtual_network.aks.id } },
+    local.runner_enabled ? {
+      runner = { name = data.azurerm_virtual_network.runner[0].name, id = data.azurerm_virtual_network.runner[0].id }
+    } : {}
+  )
+
+  # One link per (zone, vNet), keyed "<zone key>-<vnet key>", e.g. "acr-aks".
+  service_dns_zone_links = {
+    for pair in setproduct(keys(local.service_dns_zone_names), keys(local.dns_linked_vnets)) :
+    "${pair[0]}-${pair[1]}" => { zone = pair[0], vnet = pair[1] }
+  }
+
+  service_dns_zone_ids = local.central_dns ? {
+    for k, z in data.azurerm_private_dns_zone.service_central : k => z.id
+    } : {
+    for k, z in azurerm_private_dns_zone.service : k => z.id
+  }
 }
 
 # ------------------------------------------------------------ Central zones --
@@ -134,6 +165,44 @@ resource "azurerm_private_dns_zone_virtual_network_link" "aks_api_runner_central
   name                 = "${var.runner_vnet_name}-link"
   private_dns_zone_id  = data.azurerm_private_dns_zone.aks_api_central[0].id
   virtual_network_id   = data.azurerm_virtual_network.runner[0].id
+  registration_enabled = false
+  tags                 = local.tags
+}
+
+# ------------------------------------------------ Service zones (ACR, PG) --
+data "azurerm_private_dns_zone" "service_central" {
+  for_each = local.central_dns ? local.service_dns_zone_names : {}
+  provider = azurerm.dns
+
+  name                = each.value
+  resource_group_name = var.dns_zone_resource_group_name
+}
+
+resource "azurerm_private_dns_zone" "service" {
+  for_each = local.central_dns ? {} : local.service_dns_zone_names
+
+  name                = each.value
+  resource_group_name = local.rg_name
+  tags                = local.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "service" {
+  for_each = local.central_dns ? {} : local.service_dns_zone_links
+
+  name                 = "${local.dns_linked_vnets[each.value.vnet].name}-link"
+  private_dns_zone_id  = azurerm_private_dns_zone.service[each.value.zone].id
+  virtual_network_id   = local.dns_linked_vnets[each.value.vnet].id
+  registration_enabled = false
+  tags                 = local.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "service_central" {
+  for_each = local.central_dns ? local.service_dns_zone_links : {}
+  provider = azurerm.dns
+
+  name                 = "${local.dns_linked_vnets[each.value.vnet].name}-link"
+  private_dns_zone_id  = data.azurerm_private_dns_zone.service_central[each.value.zone].id
+  virtual_network_id   = local.dns_linked_vnets[each.value.vnet].id
   registration_enabled = false
   tags                 = local.tags
 }

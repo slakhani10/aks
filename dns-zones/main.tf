@@ -2,6 +2,8 @@
 # Central private DNS zones for the secure AKS environment(s):
 #   * privatelink.vaultcore.azure.net      - Key Vault private endpoints
 #   * privatelink.<region>.azmk8s.io       - private AKS API servers
+#   * privatelink.azurecr.io               - Azure Container Registry private endpoints
+#   * privatelink.postgres.database.azure.com - PostgreSQL flexible server private endpoints
 #
 # Created in an EXISTING resource group of the chosen subscription (typically a
 # hub / shared-services subscription). Zones are not linked to any vNet here:
@@ -20,6 +22,8 @@ locals {
   zones = {
     key_vault = "privatelink.vaultcore.azure.net"
     aks_api   = "privatelink.${local.aks_region}.azmk8s.io"
+    acr       = "privatelink.azurecr.io"
+    postgres  = "privatelink.postgres.database.azure.com"
   }
 }
 

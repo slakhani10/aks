@@ -112,6 +112,18 @@ run "runner_connected" {
     condition     = contains(keys(azurerm_private_dns_zone_virtual_network_link.kv), "runner")
     error_message = "The Key Vault private DNS zone must be linked to the runner vNet."
   }
+
+  assert {
+    condition = (
+      toset(keys(azurerm_private_dns_zone.service)) == toset(["acr", "postgres"]) &&
+      azurerm_private_dns_zone.service["acr"].name == "privatelink.azurecr.io" &&
+      azurerm_private_dns_zone.service["postgres"].name == "privatelink.postgres.database.azure.com" &&
+      toset(keys(azurerm_private_dns_zone_virtual_network_link.service)) == toset(["acr-aks", "acr-runner", "postgres-aks", "postgres-runner"]) &&
+      azurerm_private_dns_zone_virtual_network_link.service["postgres-runner"].name == "rg-shop-prod-vnet-runner-link" &&
+      length(azurerm_private_dns_zone_virtual_network_link.service_central) == 0
+    )
+    error_message = "ACR and PostgreSQL zones must be created locally and linked to the AKS and runner vNets."
+  }
 }
 
 run "rejects_runner_overlapping_aks" {
@@ -158,6 +170,18 @@ run "central_dns_zones_in_another_subscription" {
 
   assert {
     condition = (
+      length(azurerm_private_dns_zone.service) == 0 &&
+      length(azurerm_private_dns_zone_virtual_network_link.service) == 0 &&
+      data.azurerm_private_dns_zone.service_central["acr"].name == "privatelink.azurecr.io" &&
+      data.azurerm_private_dns_zone.service_central["postgres"].resource_group_name == "rg-dns-hub" &&
+      toset(keys(azurerm_private_dns_zone_virtual_network_link.service_central)) == toset(["acr-aks", "acr-runner", "postgres-aks", "postgres-runner"]) &&
+      startswith(azurerm_private_dns_zone_virtual_network_link.service_central["acr-aks"].private_dns_zone_id, "/subscriptions/99999999-9999-9999-9999-999999999999/")
+    )
+    error_message = "Central ACR and PostgreSQL zones must be looked up and linked to the AKS and runner vNets."
+  }
+
+  assert {
+    condition = (
       data.azurerm_private_dns_zone.kv_central[0].name == "privatelink.vaultcore.azure.net" &&
       data.azurerm_private_dns_zone.aks_api_central[0].name == "privatelink.eastus2.azmk8s.io" &&
       data.azurerm_private_dns_zone.aks_api_central[0].resource_group_name == "rg-dns-hub"
@@ -197,8 +221,35 @@ run "central_dns_without_runner" {
   assert {
     condition = (
       keys(azurerm_private_dns_zone_virtual_network_link.kv_central) == ["aks"] &&
-      length(azurerm_private_dns_zone_virtual_network_link.aks_api_runner_central) == 0
+      length(azurerm_private_dns_zone_virtual_network_link.aks_api_runner_central) == 0 &&
+      toset(keys(azurerm_private_dns_zone_virtual_network_link.service_central)) == toset(["acr-aks", "postgres-aks"])
     )
-    error_message = "Without a runner only the AKS vNet -> Key Vault zone link is created."
+    error_message = "Without a runner only the AKS vNet is linked to the central zones."
   }
+}
+
+run "service_zones_can_be_skipped" {
+  command = plan
+
+  variables {
+    postgres_private_dns_zone_name = ""
+  }
+
+  assert {
+    condition = (
+      keys(azurerm_private_dns_zone.service) == ["acr"] &&
+      keys(azurerm_private_dns_zone_virtual_network_link.service) == ["acr-aks"]
+    )
+    error_message = "An empty zone name must skip that zone and its links."
+  }
+}
+
+run "rejects_non_postgres_zone_name" {
+  command = plan
+
+  variables {
+    postgres_private_dns_zone_name = "privatelink.example.com"
+  }
+
+  expect_failures = [var.postgres_private_dns_zone_name]
 }

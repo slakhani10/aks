@@ -121,6 +121,27 @@ variable "aks_private_dns_zone_name" {
   default     = null
 }
 
+# Private DNS zones for services the workloads reach over private endpoints. They
+# are created (local mode) or looked up (central mode) and linked to the AKS vNet
+# and the runner vNet, so a registry / database added later resolves privately
+# from pods and pipelines. Set a name to "" to skip that zone.
+variable "acr_private_dns_zone_name" {
+  description = "Azure Container Registry private endpoint zone (also holds the <registry>.<region>.data records). Empty = skip."
+  type        = string
+  default     = "privatelink.azurecr.io"
+}
+
+variable "postgres_private_dns_zone_name" {
+  description = "Azure Database for PostgreSQL flexible server private endpoint zone. Empty = skip."
+  type        = string
+  default     = "privatelink.postgres.database.azure.com"
+
+  validation {
+    condition     = var.postgres_private_dns_zone_name == null || var.postgres_private_dns_zone_name == "" || endswith(var.postgres_private_dns_zone_name, "postgres.database.azure.com")
+    error_message = "postgres_private_dns_zone_name must end with postgres.database.azure.com."
+  }
+}
+
 variable "additional_tags" {
   description = "Optional extra tags added to every resource. Resource group tags are always copied and win on key conflicts."
   type        = map(string)

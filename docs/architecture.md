@@ -259,7 +259,7 @@ flowchart LR
             API["Private AKS API server :443"]:::sec
             PEKV["Key Vault private endpoint :443"]:::sec
         end
-        DNS["Private DNS zones<br/>privatelink.#lt;region#gt;.azmk8s.io<br/>privatelink.vaultcore.azure.net"]:::res
+        DNS["Private DNS zones<br/>privatelink.#lt;region#gt;.azmk8s.io<br/>privatelink.vaultcore.azure.net<br/>privatelink.azurecr.io<br/>privatelink.postgres.database.azure.com"]:::res
     end
 
     VM -->|"HTTPS long-poll for jobs<br/>(outbound only)"| NAT --> GH

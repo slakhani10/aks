@@ -22,3 +22,19 @@ output "aks_private_dns_zone_name" {
 output "aks_private_dns_zone_id" {
   value = azurerm_private_dns_zone.this["aks_api"].id
 }
+
+output "acr_private_dns_zone_name" {
+  value = azurerm_private_dns_zone.this["acr"].name
+}
+
+output "acr_private_dns_zone_id" {
+  value = azurerm_private_dns_zone.this["acr"].id
+}
+
+output "postgres_private_dns_zone_name" {
+  value = azurerm_private_dns_zone.this["postgres"].name
+}
+
+output "postgres_private_dns_zone_id" {
+  value = azurerm_private_dns_zone.this["postgres"].id
+}

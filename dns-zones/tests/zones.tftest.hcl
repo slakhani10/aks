@@ -22,7 +22,9 @@ run "zones_default_to_resource_group_region" {
     condition = (
       azurerm_private_dns_zone.this["key_vault"].name == "privatelink.vaultcore.azure.net" &&
       azurerm_private_dns_zone.this["aks_api"].name == "privatelink.northcentralus.azmk8s.io" &&
-      azurerm_private_dns_zone.this["aks_api"].resource_group_name == "rg-dns-hub"
+      azurerm_private_dns_zone.this["aks_api"].resource_group_name == "rg-dns-hub" &&
+      azurerm_private_dns_zone.this["acr"].name == "privatelink.azurecr.io" &&
+      azurerm_private_dns_zone.this["postgres"].name == "privatelink.postgres.database.azure.com"
     )
     error_message = "Unexpected zone names or resource group."
   }

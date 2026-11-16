@@ -1,9 +1,12 @@
 name: Deploy central private DNS zones
 
-# Creates the two private DNS zones the secure AKS environment(s) need, in an
+# Creates the private DNS zones the secure AKS environment(s) need, in an
 # EXISTING resource group of any subscription the workflow identity can access
 # (typically a hub / shared-services subscription):
-#   privatelink.vaultcore.azure.net   and   privatelink.<region>.azmk8s.io
+#   privatelink.vaultcore.azure.net          (Key Vault)
+#   privatelink.<region>.azmk8s.io           (private AKS API server)
+#   privatelink.azurecr.io                   (Azure Container Registry)
+#   privatelink.postgres.database.azure.com  (PostgreSQL flexible server)
 # Then run "Deploy secure AKS environment" with central_dns_zones =
 # "<subscription>/<resource group>": it uses the zones and links its vNets to them.
 

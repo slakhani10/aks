@@ -55,3 +55,11 @@ output "log_analytics_workspace_name" {
 output "oidc_issuer_url" {
   value = azurerm_kubernetes_cluster.this.oidc_issuer_url
 }
+
+output "private_dns_zone_ids" {
+  description = "Private DNS zone IDs for private endpoints (private_dns_zone_group): key_vault, aks_api, acr, postgres."
+  value = merge(
+    { key_vault = local.kv_dns_zone_id, aks_api = local.aks_dns_zone_id },
+    local.service_dns_zone_ids
+  )
+}
