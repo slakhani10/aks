@@ -32,7 +32,6 @@ resource "azurerm_storage_account" "flowlogs" {
 resource "azurerm_network_watcher_flow_log" "vnet" {
   for_each = var.enable_vnet_flow_logs ? {
     aks = azurerm_virtual_network.aks
-    agw = azurerm_virtual_network.agw
   } : {}
 
   name                 = "${each.value.name}-flowlog"

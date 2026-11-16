@@ -1,75 +1,76 @@
 # Secure AKS environment (CIS Microsoft Azure Foundations Benchmark v1.4)
 
-This repo holds Terraform (azurerm provider 5.x) and a GitHub Actions workflow. They deploy a private Azure Kubernetes Service (AKS) cluster into an **existing** resource group. The cluster is reachable from the Internet **only** through an Application Gateway with WAF.
+This repo holds Terraform (azurerm provider 5.x) and GitHub Actions workflows. They deploy a private Azure Kubernetes Service (AKS) cluster into an **existing** resource group. The cluster is reachable from the Internet **only** through **Application Gateway for Containers (AGfC) with WAF**.
 
 ```
-                     Internet
-                        │  80/443 only (NSG)
-                        ▼
- ┌──────── <rg>-vnet-agw 10.1.0.0/24 ────────┐
- │  <rg>-snet-agw 10.1.0.0/25                 │
- │  <rg>-agw  (WAF_v2, Prevention, DRS 2.1)   │
- └───────────────────┬────────────────────────┘
-                     │ vNet peering (NSG: AGW subnet → 80/443 only)
- ┌───────────────────▼──── <rg>-vnet-aks 10.0.0.0/22 ────────────────────────┐
- │ <rg>-snet-aks-ingress 10.0.1.0/28   internal LB 10.0.1.4 (backend pool)   │
- │ <rg>-snet-aks-nodes   10.0.0.0/24   <rg>-aks (private API server)         │
- │ <rg>-snet-pe          10.0.1.16/28  Key Vault private endpoint            │
- └───────────────────┬────────────────────────────────────────────────────────┘
-                     │ egress filtered by <rg>-nsg-aks (config/aks-egress-rules.json)
-                     ▼
-               <rg>-natgw (outbound only) ──► allowed Azure service tags
+                         Internet
+                            │  80/443 only (NSG on the AGfC subnet)
+                            ▼
+              <rg>-agc-fe  (AGfC frontend, Azure-managed FQDN)
+              WAF policy <rg>-wafpol: Prevention, DRS 2.1 + Bot Manager
+                            │
+ ┌──────────────────────────▼────── <rg>-vnet-aks 10.0.0.0/22 ─────────────────────────┐
+ │ <rg>-snet-agc         10.0.2.0/24   AGfC association (delegated), NSG <rg>-nsg-agc   │
+ │        │ directly to pod IPs (CNI Overlay)  - NSG: AGfC subnet → pods only          │
+ │        ▼                                                                             │
+ │ <rg>-snet-aks-nodes   10.0.0.0/24   <rg>-aks (private API server), ALB Controller   │
+ │ <rg>-snet-pe          10.0.1.16/28  Key Vault private endpoint                       │
+ └──────────────────────────┬───────────────────────────────────────────────────────────┘
+                            │ egress filtered by <rg>-nsg-aks (config/aks-egress-rules.json)
+                            ▼
+                  <rg>-natgw (outbound only) ──► allowed Azure service tags
 ```
 
-> 📐 **Diagrams:** see [`docs/architecture.md`](docs/architecture.md). It has a request flow, allowed and blocked traffic paths, a detailed network diagram with every security control marked (S1–S24), the deployment pipeline flow, and full NSG rule tables.
+> 📐 **Diagrams:** see [`docs/architecture.md`](docs/architecture.md). It has a request flow, allowed and blocked traffic paths, a detailed network diagram with every security control marked, the deployment pipeline flow, and full NSG rule tables.
 
 ## What you provide
 
 | Input | Required | Default | Notes |
 |---|---|---|---|
-| `resource_group` | yes | — | Must already exist. Its **name** is the naming prefix and its **region** is used for every resource. |
+| `resource_group` | yes | — | Must already exist. Its **name** is the naming prefix and its **region** is used for every resource. The region must [support App Gateway for Containers](https://learn.microsoft.com/azure/application-gateway/for-containers/overview#supported-regions). |
 | `system_node_vm_size` | yes | `Standard_D4ds_v5` | System pool SKU |
 | `system_node_count` | yes | `3` | System pool node count (1–100) |
 | `user_node_vm_size` | no | same as system | Workload pool SKU |
 | `user_node_count` | yes | `2` | Workload pool node count (0–1000) |
-| `aks_vnet_cidr` | yes | `10.0.0.0/22` | AKS vNet range, `/16`–`/23`. Subnets are derived from it (see below). |
-| `agw_vnet_cidr` | yes | `10.1.0.0/24` | App Gateway vNet range, `/16`–`/25` |
+| `aks_vnet_cidr` | yes | `10.0.0.0/22` | The environment's only vNet, `/16`–`/22`. Subnets are derived from it (see below). |
 | `runner` | yes | `github-hosted` | `self-hosted` runs Plan/Apply on the [private runner](#private-github-runner-optional-deploy-first) and peers its vNet |
 | `pod_cidr` | no | `10.244.0.0/16` | Overlay pod range, `/12`–`/20`. In the workflow: repository variable `AKS_POD_CIDR`. |
 | `service_cidr` | no | `172.16.0.0/16` | Kubernetes service range, `/12`–`/24`; DNS service = 10th address. In the workflow: repository variable `AKS_SERVICE_CIDR`. |
 
-Everything else has a secure default in [`terraform/variables.tf`](terraform/variables.tf). That includes admin groups, an HTTPS certificate, flow logs and log retention. Override any of them in a `terraform.tfvars` file (see [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example)) or as `TF_VAR_<name>` environment variables.
+Everything else has a secure default in [`terraform/variables.tf`](terraform/variables.tf). That includes admin groups, flow logs and log retention. Override any of them in a `terraform.tfvars` file (see [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example)) or as `TF_VAR_<name>` environment variables.
 
 ### Resulting names (resource group `rg-shop-prod` in `eastus2`)
 
 | Resource | Name |
 |---|---|
 | AKS cluster / node RG | `rg-shop-prod-aks` / `rg-shop-prod-aks-nodes` |
-| vNets | `rg-shop-prod-vnet-aks`, `rg-shop-prod-vnet-agw` |
-| Subnets | `rg-shop-prod-snet-aks-nodes`, `-snet-aks-ingress`, `-snet-pe`, `-snet-agw` |
-| NSGs | `rg-shop-prod-nsg-aks`, `rg-shop-prod-nsg-agw` |
-| App Gateway / WAF policy / PIP | `rg-shop-prod-agw`, `rg-shop-prod-wafpol`, `rg-shop-prod-pip-agw` |
+| vNet | `rg-shop-prod-vnet-aks` |
+| Subnets | `rg-shop-prod-snet-aks-nodes`, `-snet-pe`, `-snet-agc` |
+| NSGs | `rg-shop-prod-nsg-aks`, `rg-shop-prod-nsg-agc` |
+| App Gateway for Containers / frontend / association | `rg-shop-prod-agc`, `rg-shop-prod-agc-fe`, `rg-shop-prod-agc-assoc` |
+| WAF policy / AGfC security policy | `rg-shop-prod-wafpol`, `rg-shop-prod-agc-waf` |
 | NAT Gateway / PIP | `rg-shop-prod-natgw`, `rg-shop-prod-pip-natgw` |
 | Log Analytics | `rg-shop-prod-log` |
 | Key Vault | `rgshopprodkv<hash>` (alphanumeric + unique suffix: the name must be globally unique and ≤24 chars) |
-| Identities | `rg-shop-prod-id-aks`, `rg-shop-prod-id-agw` |
+| Identities | `rg-shop-prod-id-aks` (control plane), `rg-shop-prod-id-alb` (ALB Controller) |
 
 ## Network design and sizing
 
-The two vNets are separate and peered. You only pass the two vNet ranges; the subnets are carved out of them automatically, so they can never be misaligned. The defaults are roughly the smallest supported sizes, with room to grow:
+The environment uses **one vNet** with separate, NSG-protected subnets. App Gateway for Containers has to share the cluster's vNet: with Azure CNI Overlay, Microsoft [doesn't support it in a separate peered vNet in the same region](https://learn.microsoft.com/azure/application-gateway/for-containers/container-networking#cni-overlay-and-application-gateway-for-containers). Isolation comes from subnet NSGs and in-cluster Cilium network policy.
 
-| vNet / subnet | Derived as | Default | Rationale |
+You only pass the vNet range; the subnets are carved out of it automatically, so they can never be misaligned. The defaults are roughly the smallest supported sizes, with room to grow:
+
+| Subnet | Derived as | Default | Rationale |
 |---|---|---|---|
-| AKS vNet | `aks_vnet_cidr` | `10.0.0.0/22` | `/23` minimum; anything beyond it is free for extra node pools or subnets |
+| AKS vNet | `aks_vnet_cidr` | `10.0.0.0/22` | `/22` minimum: it must hold the node `/24` and the AGfC `/24` |
 | Node subnet | 1st `/24` | `10.0.0.0/24` | Azure CNI **Overlay**: pods use `pod_cidr`, so the subnet only holds node IPs (251 nodes) |
-| Ingress subnet | 1st `/28` of the 2nd `/24` | `10.0.1.0/28` | Internal load balancer frontends only (smallest Azure subnet); App Gateway targets its `.4` address |
-| Private endpoint subnet | next `/28` | `10.0.1.16/28` | Key Vault and future private endpoints |
-| App Gateway vNet | `agw_vnet_cidr` | `10.1.0.0/24` | `/25` minimum |
-| App Gateway subnet | 1st `/25` | `10.1.0.0/25` | 123 usable IPs ≥ max autoscale (10) with large headroom. Microsoft recommends a `/24` subnet if you plan to scale toward 125 instances, which needs an `agw_vnet_cidr` of `/23` or larger and a one-line change in `terraform/network.tf`. |
+| Private endpoint subnet | `/28` in the 2nd `/24` | `10.0.1.16/28` | Key Vault and future private endpoints |
+| AGfC association subnet | 3rd `/24` | `10.0.2.0/24` | App Gateway for Containers requires exactly `/24`, delegated to `Microsoft.ServiceNetworking/trafficControllers` |
+| Free | | `10.0.1.0/28`, `10.0.1.32/27`…, `10.0.3.0/24` | Extra node pools or subnets |
 
 Rules enforced at `terraform plan` time:
 * Each range must be a valid IPv4 network (e.g. `10.0.0.0/22`, not `10.0.1.0/22`) within the allowed sizes.
-* The AKS vNet, App Gateway vNet, pod and service ranges must not overlap each other. The plan fails with a message naming the overlapping pair.
+* The AKS vNet, pod and service ranges (and the runner vNet, when connected) must not overlap each other. The plan fails with a message naming the overlapping pair.
 
 You still need to make sure the ranges don't overlap networks outside this deployment that you peer or route to.
 
@@ -81,11 +82,18 @@ To add tags that aren't on the resource group, set `additional_tags`. If a key e
 
 ### No direct Internet ingress to AKS
 
-* The API server is private (`enablePrivateCluster`, no public FQDN). Local accounts are disabled and Entra ID with Azure RBAC is enforced.
-* Egress goes through a **NAT Gateway** (`outboundType: userAssignedNATGateway`), so AKS creates **no public load balancer**.
-* The Azure Policy *"Kubernetes clusters should use internal load balancers"* is assigned with **deny**. A `Service` that would get a public IP is rejected.
-* `<rg>-nsg-aks` denies inbound traffic from `Internet`. It allows traffic from the App Gateway subnet on 80/443 only, and denies everything else from the App Gateway vNet.
-* App Gateway WAF_v2 runs in **Prevention** mode with Microsoft Default Rule Set 2.1, Bot Manager, TLS 1.2+ (`AppGwSslPolicy20220101S`) and HTTP/2. Its backend pool is the static internal load balancer IP `10.0.1.4` in the ingress subnet.
+* **The only entry point** is the AGfC frontend (an Azure-managed FQDN). Its listeners accept only ports 80/443, and the WAF policy (**Prevention**, Microsoft Default Rule Set 2.1 + Bot Manager 1.0) is applied to **every** listener and route on the platform Gateway.
+* **WAF is enabled in two places, and both are required:**
+  * the Azure security policy `<rg>-agc-waf` (Terraform);
+  * the in-cluster `WebApplicationFirewallPolicy` targeting the whole Gateway ([`k8s/platform/gateway.yaml`](k8s/platform/gateway.yaml)).
+
+  With only one of them, AGfC doesn't inspect traffic.
+* `<rg>-nsg-agc` allows only Internet → 80/443 plus `AzureLoadBalancer` into the AGfC subnet, and outbound traffic to the pod range.
+* `<rg>-nsg-aks` allows the AGfC subnet to reach **pod IPs only**. It denies everything else from that subnet, and all inbound traffic from `Internet`.
+* No Kubernetes `Service` is exposed on a load balancer. Workloads publish an `HTTPRoute` on the platform Gateway, and only namespaces labelled `agc-routes: allowed` may attach routes.
+* The API server is private (no public FQDN). Local accounts are disabled and Entra ID with Azure RBAC is enforced.
+* Egress goes through a **NAT Gateway** (`outboundType: userAssignedNATGateway`), so AKS creates **no public load balancer**. The Azure Policy *"Kubernetes clusters should use internal load balancers"* (deny) rejects any `Service` that would get a public IP.
+* The **ALB Controller** (the in-cluster component that programs AGfC) uses a **workload identity**, so it holds no secrets. It has only *AppGw for Containers Configuration Manager* on the resource group and *Network Contributor* on the AGfC subnet.
 
 ### Egress limited by an editable NSG
 
@@ -102,7 +110,7 @@ Default policy:
 | 140 | AzureCloud | 443 | Allow (catch-all for Azure-hosted AKS dependencies) |
 | 4000 | Internet | * | **Deny** |
 
-Traffic inside the vNet (private endpoints, peered App Gateway) and Azure DNS are not affected.
+Traffic inside the vNet (private endpoints, AGfC, peered runner) and Azure DNS are not affected. The ALB Controller's endpoints (`management.azure.com`, `login.microsoftonline.com`, `*.alb.azure.com`, `mcr.microsoft.com`) are Azure-hosted and covered by these rules.
 
 > ⚠️ **Limits of NSG-based egress control.** AKS outbound dependencies are defined as FQDNs. Microsoft documents that NSGs cannot express them exactly ([docs](https://learn.microsoft.com/azure/aks/outbound-rules-control-egress)). The `AzureCloud:443` rule keeps cluster creation, upgrades and scaling working. It still blocks all non-Azure Internet destinations, such as Docker Hub, GitHub and arbitrary sites. For FQDN-level control, put Azure Firewall in front, or use a [network-isolated cluster](https://learn.microsoft.com/azure/aks/concepts-network-isolated) with a private ACR, and then tighten or remove `Allow-AzureCloud-443`. To pull images from a registry outside Azure, add an allow rule above priority 4000.
 
@@ -112,13 +120,13 @@ Traffic inside the vNet (private endpoints, peered App Gateway) and Azure DNS ar
 |---|---|---|
 | 3 Storage (3.1) | Secure transfer required | Flow-log storage account: `supportsHttpsTrafficOnly` |
 | 3 Storage | Public access disabled, default network deny, TLS 1.2 | `allowBlobPublicAccess=false`, `publicNetworkAccess=Disabled`, `defaultAction=Deny`, `minimumTlsVersion=TLS1_2`, infrastructure encryption |
-| 5 Logging & Monitoring | Diagnostic settings that capture the appropriate categories | AKS control plane (incl. `kube-audit-admin`, `guard`), App Gateway (access + firewall), NSGs, public IPs and Key Vault all send to `<rg>-log` |
+| 5 Logging & Monitoring | Diagnostic settings that capture the appropriate categories | AKS control plane (incl. `kube-audit-admin`, `guard`), App Gateway for Containers (access + WAF logs), NSGs, public IP and Key Vault all send to `<rg>-log` |
 | 5 Logging & Monitoring | Key Vault logging enabled | Key Vault `allLogs` (AuditEvent) to Log Analytics |
-| 6 Networking (6.1 / 6.2) | RDP / SSH access from the Internet is restricted | Both NSGs deny inbound Internet except 80/443 to the App Gateway; nodes have no public IPs |
+| 6 Networking (6.1 / 6.2) | RDP / SSH access from the Internet is restricted | Both NSGs deny inbound Internet except 80/443 to the AGfC subnet; nodes have no public IPs |
 | 6 Networking (6.4 – 6.6) | Flow logs captured, retention > 90 days, Network Watcher enabled | Optional VNet flow logs (successor to NSG flow logs) in the regional Network Watcher, 365-day retention, Traffic Analytics (`enable_vnet_flow_logs = true`) |
 | 7 Virtual Machines | Disks encrypted | Managed disks encrypted at rest by the platform, plus **encryption at host** on all node pools |
 | 8 Other (Key Vault) | Key Vault recoverable | Soft delete (90 days) and purge protection |
-| 8 Other (Key Vault) | RBAC for Key Vault | `enableRbacAuthorization=true`; least-privilege `Key Vault Secrets User` for the CSI driver and the App Gateway |
+| 8 Other (Key Vault) | RBAC for Key Vault | `enableRbacAuthorization=true`; least-privilege `Key Vault Secrets User` for the CSI driver |
 | 8 Other (Key Vault) | Private endpoints for Key Vault | Public network access disabled; private endpoint and `privatelink.vaultcore.azure.net` linked to both vNets |
 | 8 Other (AKS) | RBAC enabled on AKS | Kubernetes RBAC with Entra ID and **Azure RBAC**, local accounts disabled |
 | 2 Defender for Cloud | Defender for Containers | Defender sensor enabled on the cluster (`securityProfile.defender`); the plan itself is enabled per subscription (see below) |
@@ -144,7 +152,8 @@ Workflow: [`.github/workflows/deploy-aks.yml`](.github/workflows/deploy-aks.yml)
   * `action=apply` applies the **exact saved plan** after approval on the `azure-production` environment.
   * `action=destroy` plans and applies a destroy through the same approval gate.
 * State is stored per resource group (`<rg>.tfstate`) in an Azure Storage container, using Entra ID auth and blob-lease locking.
-* `deploy_sample_app=true` deploys [`k8s/sample-app.yaml`](k8s/sample-app.yaml) through `az aks command invoke`, because the API server is private. The step then waits for App Gateway backend health and sends a request through the WAF.
+* Every `apply` installs or updates the **ALB Controller** (Helm chart `alb-controller`, version pinned in `ALB_CONTROLLER_VERSION`). It also applies the **platform Gateway and WAF policy** ([`k8s/platform/gateway.yaml`](k8s/platform/gateway.yaml)) through `az aks command invoke`, because the API server is private.
+* `deploy_sample_app=true` deploys [`k8s/sample-app.yaml`](k8s/sample-app.yaml) with an `HTTPRoute`. The workflow then waits until the AGfC frontend returns HTTP 200, and checks that the WAF blocks a SQL-injection probe with HTTP 403. On failure, a diagnostics step prints the Gateway, route, controller and pod state.
 
 ### 1. Create an identity with OIDC federation (no secrets)
 
@@ -200,7 +209,7 @@ az role assignment create --assignee "$APP_ID" --role "Network Contributor" \
   --scope /subscriptions/$SUB/resourceGroups/NetworkWatcherRG
 ```
 
-You can constrain `Role Based Access Control Administrator` with a condition that limits it to the roles this configuration assigns: Network Contributor, Private DNS Zone Contributor, Key Vault Secrets User, and Azure Kubernetes Service RBAC Cluster Admin.
+You can constrain `Role Based Access Control Administrator` with a condition that limits it to the roles this configuration assigns: Network Contributor, Private DNS Zone Contributor, Key Vault Secrets User, AppGw for Containers Configuration Manager, and Azure Kubernetes Service RBAC Cluster Admin.
 
 **Let Terraform recover soft-deleted Key Vaults (recommended).** After a `destroy`, the Key Vault stays soft-deleted for 90 days under the same name. The provider is configured to *recover* it on the next `apply` (`recover_soft_deleted_key_vaults = true`), which keeps its secrets and lets purge protection stay on. To see deleted vaults, though, the deployment identity needs `Microsoft.KeyVault/locations/deletedVaults/read`, which exists only at **subscription** scope. Without it, `apply` fails with `409 … A vault with the same name already exists in deleted state`. This custom role grants only that read permission:
 
@@ -219,7 +228,8 @@ az role assignment create --assignee "$APP_ID" --role "Key Vault Deleted Vault R
 ```bash
 az feature register --namespace Microsoft.Compute --name EncryptionAtHost
 for ns in Microsoft.ContainerService Microsoft.Network Microsoft.KeyVault Microsoft.OperationalInsights \
-          Microsoft.Insights Microsoft.Compute Microsoft.Storage Microsoft.PolicyInsights Microsoft.Security; do
+          Microsoft.Insights Microsoft.Compute Microsoft.Storage Microsoft.PolicyInsights Microsoft.Security \
+          Microsoft.ServiceNetworking Microsoft.NetworkFunction; do
   az provider register -n $ns
 done
 ```
@@ -251,7 +261,7 @@ Then run **Actions → Deploy secure AKS environment → Run workflow**.
 | Workflow input | Default | Notes |
 |---|---|---|
 | `resource_group` | — | The same existing resource group as the AKS environment |
-| `runner_vnet_cidr` | `10.2.0.0/26` | `/16`–`/28`. The runner subnet is the first `/28` (11 IPs). It must not overlap the AKS, App Gateway, pod or service ranges; the AKS plan fails if it does. |
+| `runner_vnet_cidr` | `10.2.0.0/26` | `/16`–`/28`. The runner subnet is the first `/28` (11 IPs). It must not overlap the AKS vNet, pod or service ranges; the AKS plan fails if it does. |
 | `runner_vm_size` | `Standard_D2s_v5` | Needs Gen2 / Trusted Launch support |
 | `runner_count` | `1` | 1–11 VMs: `<rg>-runner-01`, `-02`, … |
 | `action` | `plan` | `apply` deploys and registers the runners; `destroy` deletes the VMs and unregisters them from GitHub |
@@ -292,26 +302,42 @@ For interactive access from inside the network, use the [private GitHub runner](
 
 ## Exposing your applications
 
-App Gateway forwards to the internal load balancer IP in the `ingress_private_ip` output (default `10.0.1.4`). Expose your ingress controller with a `Service` annotated like this:
+Workloads are published with the Kubernetes **Gateway API**. They don't use load balancers or `Ingress` objects. The platform Gateway `ingress/agc-gateway` is bound to the Terraform-created AGfC resource and frontend, and is WAF-protected. To publish an app:
+
+1. Label its namespace with `agc-routes: allowed`. Only labelled namespaces can attach routes to the Internet-facing Gateway.
+2. Give it a `ClusterIP` Service and an `HTTPRoute` that references the Gateway:
 
 ```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
-  annotations:
-    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "<rg>-snet-aks-ingress"
-    service.beta.kubernetes.io/azure-load-balancer-ipv4: "10.0.1.4"
+  name: my-app
+  namespace: my-app            # namespace labelled agc-routes: allowed
 spec:
-  type: LoadBalancer
+  parentRefs:
+    - name: agc-gateway
+      namespace: ingress
+      sectionName: http
+  hostnames: ["app.contoso.com"] # optional; CNAME it to the agc_frontend_fqdn output
+  rules:
+    - backendRefs:
+        - name: my-app
+          port: 80
 ```
 
-The App Gateway forwards the client's `Host` header, so host-based ingress rules keep working. The health probe calls `GET /` with host `127.0.0.1` and expects 200–399. Adjust the probe in `terraform/appgateway.tf` if your ingress returns 404 for unknown hosts.
+AGfC proxies straight to the pod IPs and health-probes them. A readiness probe on the pods and a NetworkPolicy that allows the container port keep this working. [`k8s/sample-app.yaml`](k8s/sample-app.yaml) is a complete example. The WAF policy applies automatically, because it targets the whole Gateway. To give a single route its own WAF policy, add another `WebApplicationFirewallPolicy` targeting that `HTTPRoute`.
 
 ### HTTPS
 
-1. Import a PFX certificate into the environment's Key Vault. The vault is private, so do this from inside the network (for example a workflow job on the [private runner](#private-github-runner-optional-deploy-first)), or temporarily allow your IP.
-2. Re-apply with `app_gateway_certificate_kv_uri = "https://<vault>.vault.azure.net/secrets/<cert-name>"`. Use the versionless URI so the certificate rotates automatically.
+AGfC terminates TLS from a Kubernetes `kubernetes.io/tls` Secret referenced by a Gateway listener:
 
-The App Gateway identity `<rg>-id-agw` already has `Key Vault Secrets User` on the vault. The deployment adds an HTTPS listener and a permanent HTTP→HTTPS redirect.
+1. Store the certificate in the environment's Key Vault. The vault is private, so do this from inside the network (for example a workflow job on the [private runner](#private-github-runner-optional-deploy-first)), or temporarily allow your IP.
+2. Sync it into the `ingress` namespace as a TLS Secret. The Secrets Store CSI driver is already enabled; use a `SecretProviderClass` with `secretObjects`, and give it workload identity with *Key Vault Secrets User*.
+3. Add an HTTPS listener to [`k8s/platform/gateway.yaml`](k8s/platform/gateway.yaml) (`port: 443`, `protocol: HTTPS`, `tls.certificateRefs`). Then redirect HTTP to HTTPS with an `HTTPRoute` `RequestRedirect` filter. AGfC accepts TLS 1.2 and 1.3 only.
+
+### Migrating from the earlier App Gateway (WAF_v2) design
+
+`terraform apply` removes the App Gateway, its vNet, peering and public IP, and the internal ingress subnet, and adds the AGfC resources. Before Terraform runs, the workflow deletes the old smoke-test `LoadBalancer` Service, which otherwise blocks the subnet deletion. If you created other internal `LoadBalancer` Services in `<rg>-snet-aks-ingress`, delete them first and republish them through an `HTTPRoute`.
 
 ## Repository layout
 
@@ -322,7 +348,7 @@ terraform/
   main.tf                       # naming, locals, Log Analytics workspace
   network.tf                    # vNets, subnets, NSGs + rules, NAT GW, peering
   aks.tf                        # private AKS cluster, user pool, Container Insights, RBAC
-  appgateway.tf                 # WAF policy + App Gateway WAF_v2
+  agc.tf                        # App Gateway for Containers, WAF policy + security policy, ALB Controller identity
   keyvault.tf                   # Key Vault, private endpoint, private DNS, RBAC
   policy.tf                     # Azure Policy assignments (internal LB, pod security)
   flowlogs.tf                   # optional VNet flow logs
@@ -338,7 +364,9 @@ runner/                         # separate Terraform root: private GitHub runner
   scripts/register-runner.sh    # run on the VM via az vm run-command
   config/runner-egress-rules.json
   tests/                        # offline `terraform test` suite
-k8s/sample-app.yaml             # smoke-test app on the internal LB
+k8s/platform/gateway.yaml       # platform Gateway + WebApplicationFirewallPolicy (applied every apply)
+k8s/sample-app.yaml             # smoke-test app (HTTPRoute on the Gateway)
+.github/scripts/aks-invoke.sh   # runs kubectl/helm in the private cluster via az aks command invoke
 .github/workflows/deploy-aks.yml
 .github/workflows/deploy-runner.yml
 ```

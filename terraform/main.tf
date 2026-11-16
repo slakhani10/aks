@@ -5,7 +5,7 @@
 #   * are created in the resource group's region
 #   * are named with the resource group name as prefix: <rg>-aks, <rg>-vnet-aks, ...
 #
-# Traffic flow: Internet -> App Gateway WAF_v2 (own vNet) -> peering -> AKS internal LB
+# Traffic flow: Internet -> App Gateway for Containers frontend + WAF -> pods (CNI Overlay)
 # AKS egress:   NAT Gateway, filtered by NSG rules in config/aks-egress-rules.json
 # =============================================================================
 
@@ -35,9 +35,6 @@ locals {
   aks_name          = "${local.prefix}-aks"
   user_node_vm_size = coalesce(var.user_node_vm_size, var.system_node_vm_size)
 
-  # Static private IP of the AKS internal LB that App Gateway forwards to
-  # (first usable address in an Azure subnet: .4).
-  ingress_private_ip = cidrhost(local.aks_ingress_subnet_cidr, 4)
 
   egress_rules = jsondecode(file("${path.module}/config/aks-egress-rules.json"))
 }

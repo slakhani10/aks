@@ -1,9 +1,14 @@
 # -----------------------------------------------------------------------------
-# Networking: two separate, peered virtual networks
-#   * AKS vNet         -> node subnet, internal-ingress subnet, private-endpoint subnet
-#   * App Gateway vNet -> dedicated Application Gateway (WAF_v2) subnet
-# Every subnet has an NSG (CIS 6.x). AKS egress goes through a NAT Gateway and is
-# filtered by the NSG egress rules in config/aks-egress-rules.json.
+# Networking: one AKS vNet with separate, NSG-protected subnets
+#   * nodes  - AKS node pools (CNI Overlay: pods use pod_cidr, not vNet IPs)
+#   * pe     - private endpoints (Key Vault)
+#   * agc    - Application Gateway for Containers association subnet (/24, delegated)
+#
+# Application Gateway for Containers must share the cluster's vNet: with Azure CNI
+# Overlay, Microsoft does not support it in a separate (peered) vNet in the same
+# region. Isolation is enforced per subnet with NSGs and in-cluster with Cilium
+# network policy. AKS egress goes through a NAT Gateway and is filtered by the NSG
+# egress rules in config/aks-egress-rules.json.
 # -----------------------------------------------------------------------------
 
 # ------------------------------------------------ Optional private runner --
@@ -20,12 +25,10 @@ locals {
 
   # --------------------------------------------- Subnets derived from inputs --
   aks_vnet_bits = tonumber(split("/", var.aks_vnet_cidr)[1])
-  agw_vnet_bits = tonumber(split("/", var.agw_vnet_cidr)[1])
 
-  aks_node_subnet_cidr    = cidrsubnet(var.aks_vnet_cidr, 24 - local.aks_vnet_bits, 0)  # 1st /24
-  aks_ingress_subnet_cidr = cidrsubnet(var.aks_vnet_cidr, 28 - local.aks_vnet_bits, 16) # /28 at start of 2nd /24
-  aks_pe_subnet_cidr      = cidrsubnet(var.aks_vnet_cidr, 28 - local.aks_vnet_bits, 17) # next /28
-  agw_subnet_cidr         = cidrsubnet(var.agw_vnet_cidr, 25 - local.agw_vnet_bits, 0)  # 1st /25
+  aks_node_subnet_cidr = cidrsubnet(var.aks_vnet_cidr, 24 - local.aks_vnet_bits, 0)  # 1st /24
+  aks_pe_subnet_cidr   = cidrsubnet(var.aks_vnet_cidr, 28 - local.aks_vnet_bits, 17) # 2nd /28 of the 2nd /24
+  agc_subnet_cidr      = cidrsubnet(var.aks_vnet_cidr, 24 - local.aks_vnet_bits, 2)  # 3rd /24 (AGfC needs exactly /24)
 
   dns_service_ip = cidrhost(var.service_cidr, 10)
 
@@ -34,7 +37,6 @@ locals {
   cidr_ranges = {
     for name, cidr in merge({
       aks_vnet = var.aks_vnet_cidr
-      agw_vnet = var.agw_vnet_cidr
       pod      = var.pod_cidr
       service  = var.service_cidr
       }, { for i, c in local.runner_vnet_ranges : "runner_vnet_${i}" => c }) : name => {
@@ -53,29 +55,30 @@ locals {
     local.cidr_ranges[local.cidr_names[pair[1]]].first < local.cidr_ranges[local.cidr_names[pair[0]]].first + local.cidr_ranges[local.cidr_names[pair[0]]].size
   ]
 
+  # ------------------------------------------------- NSG: AKS subnets ---------
   aks_inbound_rules = {
-    "Allow-AppGateway-HTTP-HTTPS-Inbound" = {
-      description                = "Only the Application Gateway subnet may reach the internal ingress on 80/443."
+    "Allow-AGC-To-Pods-Inbound" = {
+      description                = "App Gateway for Containers proxies directly to pod IPs (overlay) and runs health probes."
       priority                   = 100
       direction                  = "Inbound"
       access                     = "Allow"
       protocol                   = "Tcp"
-      source_address_prefix      = local.agw_subnet_cidr
-      destination_address_prefix = var.aks_vnet_cidr
-      destination_port_ranges    = ["80", "443"]
+      source_address_prefix      = local.agc_subnet_cidr
+      destination_address_prefix = var.pod_cidr
+      destination_port_ranges    = ["*"]
     }
-    "Deny-AppGateway-Other-Inbound" = {
-      description                = "Block any other traffic from the peered Application Gateway vNet."
+    "Deny-AGC-Other-Inbound" = {
+      description                = "Block any other traffic from the App Gateway for Containers subnet (e.g. to nodes or endpoints)."
       priority                   = 110
       direction                  = "Inbound"
       access                     = "Deny"
       protocol                   = "*"
-      source_address_prefix      = var.agw_vnet_cidr
+      source_address_prefix      = local.agc_subnet_cidr
       destination_address_prefix = "*"
       destination_port_ranges    = ["*"]
     }
     "Deny-Internet-Inbound" = {
-      description                = "No direct Internet ingress to AKS. All user traffic must traverse the App Gateway WAF."
+      description                = "No direct Internet ingress to AKS. All user traffic must traverse the App Gateway for Containers WAF."
       priority                   = 4000
       direction                  = "Inbound"
       access                     = "Deny"
@@ -129,13 +132,54 @@ locals {
       name   = "${local.prefix}-snet-aks-nodes"
       prefix = local.aks_node_subnet_cidr
     }
-    ingress = {
-      name   = "${local.prefix}-snet-aks-ingress"
-      prefix = local.aks_ingress_subnet_cidr
-    }
     pe = {
       name   = "${local.prefix}-snet-pe"
       prefix = local.aks_pe_subnet_cidr
+    }
+  }
+
+  # ------------------------------------- NSG: App Gateway for Containers ------
+  # https://learn.microsoft.com/azure/application-gateway/for-containers/application-gateway-for-containers-components#network-security-groups-on-the-association-subnet
+  agc_nsg_rules = {
+    "Allow-Internet-HTTP-HTTPS-Inbound" = {
+      description                = "Client traffic to the App Gateway for Containers frontend (listeners only support 80/443)."
+      priority                   = 100
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_address_prefix      = "Internet"
+      destination_address_prefix = "*"
+      destination_port_ranges    = ["80", "443"]
+    }
+    "Allow-AzureLoadBalancer-Inbound" = {
+      description                = "Required for App Gateway for Containers operation."
+      priority                   = 110
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "*"
+      source_address_prefix      = "AzureLoadBalancer"
+      destination_address_prefix = "*"
+      destination_port_ranges    = ["*"]
+    }
+    "Deny-All-Inbound" = {
+      description                = "Nothing else may reach the App Gateway for Containers subnet."
+      priority                   = 4096
+      direction                  = "Inbound"
+      access                     = "Deny"
+      protocol                   = "*"
+      source_address_prefix      = "*"
+      destination_address_prefix = "*"
+      destination_port_ranges    = ["*"]
+    }
+    "Allow-To-Pods-Outbound" = {
+      description                = "Proxy and health-probe traffic to backend pods (overlay pod range)."
+      priority                   = 100
+      direction                  = "Outbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_address_prefix      = "*"
+      destination_address_prefix = var.pod_cidr
+      destination_port_ranges    = ["*"]
     }
   }
 }
@@ -166,63 +210,30 @@ resource "azurerm_network_security_rule" "aks" {
   network_security_group_name = azurerm_network_security_group.aks.name
 }
 
-# ------------------------------------------------------ NSG: App Gateway ----
-# Rules required by Application Gateway v2:
-# https://learn.microsoft.com/azure/application-gateway/configuration-infrastructure#network-security-groups
-resource "azurerm_network_security_group" "agw" {
-  name                = "${local.prefix}-nsg-agw"
+# ------------------------------------- NSG: App Gateway for Containers ------
+resource "azurerm_network_security_group" "agc" {
+  name                = "${local.prefix}-nsg-agc"
   location            = local.location
   resource_group_name = local.rg_name
   tags                = local.tags
+}
 
-  security_rule {
-    name                       = "Allow-Internet-HTTP-HTTPS-Inbound"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_address_prefix      = "Internet"
-    source_port_range          = "*"
-    destination_address_prefix = local.agw_subnet_cidr
-    destination_port_ranges    = ["80", "443"]
-  }
+resource "azurerm_network_security_rule" "agc" {
+  for_each = local.agc_nsg_rules
 
-  security_rule {
-    name                       = "Allow-GatewayManager-Inbound"
-    description                = "Required by the Application Gateway v2 control plane."
-    priority                   = 110
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_address_prefix      = "GatewayManager"
-    source_port_range          = "*"
-    destination_address_prefix = "*"
-    destination_port_range     = "65200-65535"
-  }
-
-  security_rule {
-    name                       = "Allow-AzureLoadBalancer-Inbound"
-    priority                   = 120
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "*"
-    source_address_prefix      = "AzureLoadBalancer"
-    source_port_range          = "*"
-    destination_address_prefix = "*"
-    destination_port_range     = "*"
-  }
-
-  security_rule {
-    name                       = "Deny-All-Inbound"
-    priority                   = 4096
-    direction                  = "Inbound"
-    access                     = "Deny"
-    protocol                   = "*"
-    source_address_prefix      = "*"
-    source_port_range          = "*"
-    destination_address_prefix = "*"
-    destination_port_range     = "*"
-  }
+  name                        = each.key
+  description                 = each.value.description
+  priority                    = each.value.priority
+  direction                   = each.value.direction
+  access                      = each.value.access
+  protocol                    = each.value.protocol
+  source_address_prefix       = each.value.source_address_prefix
+  source_port_range           = "*"
+  destination_address_prefix  = each.value.destination_address_prefix
+  destination_port_range      = length(each.value.destination_port_ranges) == 1 ? each.value.destination_port_ranges[0] : null
+  destination_port_ranges     = length(each.value.destination_port_ranges) > 1 ? each.value.destination_port_ranges : null
+  resource_group_name         = local.rg_name
+  network_security_group_name = azurerm_network_security_group.agc.name
 }
 
 # ------------------------------------------------------- NAT Gateway ---------
@@ -250,7 +261,7 @@ resource "azurerm_nat_gateway_public_ip_association" "this" {
   public_ip_address_id = azurerm_public_ip.natgw.id
 }
 
-# ------------------------------------------------------------ vNets ---------
+# -------------------------------------------------------------- vNet --------
 resource "azurerm_virtual_network" "aks" {
   name                = "${local.prefix}-vnet-aks"
   location            = local.location
@@ -289,49 +300,31 @@ resource "azurerm_subnet_nat_gateway_association" "aks_nodes" {
   nat_gateway_id = azurerm_nat_gateway.this.id
 }
 
-resource "azurerm_virtual_network" "agw" {
-  name                = "${local.prefix}-vnet-agw"
-  location            = local.location
-  resource_group_name = local.rg_name
-  address_space       = [var.agw_vnet_cidr]
-  tags                = local.tags
-}
-
-resource "azurerm_subnet" "agw" {
-  name                 = "${local.prefix}-snet-agw"
+resource "azurerm_subnet" "agc" {
+  name                 = "${local.prefix}-snet-agc"
   resource_group_name  = local.rg_name
-  virtual_network_name = azurerm_virtual_network.agw.name
-  address_prefixes     = [local.agw_subnet_cidr]
+  virtual_network_name = azurerm_virtual_network.aks.name
+  address_prefixes     = [local.agc_subnet_cidr]
+
+  delegation {
+    name = "trafficControllers"
+    service_delegation {
+      name    = "Microsoft.ServiceNetworking/trafficControllers"
+      actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+    }
+  }
 }
 
-resource "azurerm_subnet_network_security_group_association" "agw" {
-  subnet_id                 = azurerm_subnet.agw.id
-  network_security_group_id = azurerm_network_security_group.agw.id
+# The NSG must exist before the association is created: associations created after
+# April 2026 enforce NSG rules fully, including on ports 80/443.
+resource "azurerm_subnet_network_security_group_association" "agc" {
+  subnet_id                 = azurerm_subnet.agc.id
+  network_security_group_id = azurerm_network_security_group.agc.id
+
+  depends_on = [azurerm_network_security_rule.agc]
 }
 
 # ------------------------------------------------------------ Peering -------
-resource "azurerm_virtual_network_peering" "aks_to_agw" {
-  name                         = "peer-to-${azurerm_virtual_network.agw.name}"
-  resource_group_name          = local.rg_name
-  virtual_network_name         = azurerm_virtual_network.aks.name
-  remote_virtual_network_id    = azurerm_virtual_network.agw.id
-  allow_virtual_network_access = true
-  allow_forwarded_traffic      = false
-  allow_gateway_transit        = false
-  use_remote_gateways          = false
-}
-
-resource "azurerm_virtual_network_peering" "agw_to_aks" {
-  name                         = "peer-to-${azurerm_virtual_network.aks.name}"
-  resource_group_name          = local.rg_name
-  virtual_network_name         = azurerm_virtual_network.agw.name
-  remote_virtual_network_id    = azurerm_virtual_network.aks.id
-  allow_virtual_network_access = true
-  allow_forwarded_traffic      = false
-  allow_gateway_transit        = false
-  use_remote_gateways          = false
-}
-
 resource "azurerm_virtual_network_peering" "aks_to_runner" {
   count = local.runner_enabled ? 1 : 0
 
@@ -362,7 +355,7 @@ resource "azurerm_virtual_network_peering" "runner_to_aks" {
 resource "azurerm_monitor_diagnostic_setting" "nsg" {
   for_each = {
     aks = azurerm_network_security_group.aks.id
-    agw = azurerm_network_security_group.agw.id
+    agc = azurerm_network_security_group.agc.id
   }
 
   name                       = "to-log-analytics"

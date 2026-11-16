@@ -10,25 +10,33 @@ output "aks_node_resource_group" {
   value = azurerm_kubernetes_cluster.this.node_resource_group
 }
 
-output "app_gateway_name" {
-  value = azurerm_application_gateway.this.name
+output "agc_id" {
+  description = "App Gateway for Containers resource ID (Gateway annotation alb.networking.azure.io/alb-id)."
+  value       = azurerm_application_load_balancer.this.id
 }
 
-output "app_gateway_public_ip" {
-  value = azurerm_public_ip.agw.ip_address
+output "agc_frontend_name" {
+  description = "Frontend name referenced by the Gateway's addresses (type alb.networking.azure.io/alb-frontend)."
+  value       = azurerm_application_load_balancer_frontend.this.name
 }
 
-output "app_gateway_fqdn" {
-  value = azurerm_public_ip.agw.fqdn
+output "agc_frontend_fqdn" {
+  description = "Public entry point. Point your DNS CNAME here."
+  value       = azurerm_application_load_balancer_frontend.this.fully_qualified_domain_name
 }
 
-output "ingress_private_ip" {
-  description = "Static IP the AKS internal load balancer / ingress controller must use (App Gateway backend)."
-  value       = local.ingress_private_ip
+output "waf_policy_id" {
+  description = "Referenced by the in-cluster WebApplicationFirewallPolicy."
+  value       = azurerm_web_application_firewall_policy.this.id
 }
 
-output "ingress_subnet_name" {
-  value = azurerm_subnet.aks["ingress"].name
+output "alb_controller_client_id" {
+  description = "Workload identity client ID for the ALB Controller Helm chart (albController.podIdentity.clientID)."
+  value       = azurerm_user_assigned_identity.alb.client_id
+}
+
+output "alb_controller_namespace" {
+  value = local.alb_controller_namespace
 }
 
 output "key_vault_name" {

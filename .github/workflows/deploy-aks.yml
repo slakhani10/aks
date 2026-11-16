@@ -28,14 +28,9 @@ on:
         default: 2
         type: number
       aks_vnet_cidr:
-        description: "AKS vNet CIDR (/16-/23). Subnets are derived from it"
+        description: "AKS vNet CIDR (/16-/22). Node, private endpoint and App Gateway for Containers subnets are derived from it"
         required: true
         default: "10.0.0.0/22"
-        type: string
-      agw_vnet_cidr:
-        description: "App Gateway vNet CIDR (/16-/25). Must not overlap the AKS vNet"
-        required: true
-        default: "10.1.0.0/24"
         type: string
       action:
         description: "plan = preview only, apply = apply the reviewed plan, destroy = plan + apply a destroy"
@@ -79,6 +74,7 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
   WORKDIR: terraform
+  ALB_CONTROLLER_VERSION: "1.13.0" # App Gateway for Containers ALB Controller Helm chart
   # azurerm provider + backend authentication via GitHub OIDC
   ARM_USE_OIDC: "true"
   ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -132,7 +128,6 @@ jobs:
       TF_VAR_user_node_vm_size: ${{ inputs.user_node_vm_size }}
       TF_VAR_user_node_count: ${{ inputs.user_node_count }}
       TF_VAR_aks_vnet_cidr: ${{ inputs.aks_vnet_cidr }}
-      TF_VAR_agw_vnet_cidr: ${{ inputs.agw_vnet_cidr }}
       # Peer the private runner vNet (created by deploy-runner.yml) when running on it.
       TF_VAR_runner_vnet_name: ${{ inputs.runner == 'self-hosted' && format('{0}-vnet-runner', inputs.resource_group) || '' }}
     steps:
@@ -274,6 +269,23 @@ jobs:
             -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
             -backend-config="key=${RG}.tfstate"
 
+      # Migration from the earlier App Gateway (WAF_v2) design: the old smoke-test
+      # Service holds an internal load balancer IP in the subnet Terraform is about
+      # to delete, which would fail with InUseSubnetCannotBeDeleted. Idempotent.
+      - name: Remove legacy internal load balancer Service (migration)
+        if: inputs.action == 'apply'
+        working-directory: .
+        run: |
+          AKS_NAME="$(echo "$RG" | tr '[:upper:]' '[:lower:]')-aks"
+          if az aks show -g "$RG" -n "$AKS_NAME" --query id -o tsv >/dev/null 2>&1; then
+            AKS_INVOKE_ATTEMPTS=2 .github/scripts/aks-invoke.sh "$RG" "$AKS_NAME" \
+              "kubectl -n sample-app get svc hello -o jsonpath='{.spec.type}' 2>/dev/null | grep -q LoadBalancer \
+                 && kubectl -n sample-app delete svc hello --wait=true || echo 'no legacy LoadBalancer Service'" \
+              || echo "::warning::Could not check for the legacy smoke-test Service"
+          else
+            echo "Cluster $AKS_NAME does not exist yet - nothing to migrate"
+          fi
+
       - name: terraform apply
         run: terraform apply -no-color tfplan
 
@@ -282,7 +294,7 @@ jobs:
         if: inputs.action == 'apply'
         run: |
           terraform output -json > outputs.json
-          for key in aks_name app_gateway_name app_gateway_public_ip ingress_private_ip ingress_subnet_name; do
+          for key in aks_name agc_id agc_frontend_name agc_frontend_fqdn waf_policy_id alb_controller_client_id alb_controller_namespace; do
             echo "$key=$(jq -r ".${key}.value" outputs.json)" >> "$GITHUB_OUTPUT"
           done
           {
@@ -297,88 +309,95 @@ jobs:
       # and `az aks command invoke` must then fetch a NEW token (AKS/Entra audience),
       # which fails with AADSTS700024 unless we sign in again right here.
       - name: Azure login (refresh after terraform apply)
-        if: inputs.action == 'apply' && inputs.deploy_sample_app
+        if: inputs.action == 'apply'
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy smoke-test app (via az aks command invoke)
+      # Cluster-side half of App Gateway for Containers: the ALB Controller (Helm, with
+      # workload identity) plus the platform Gateway and its WAF policy. Idempotent.
+      - name: Install ALB Controller and WAF-protected Gateway
+        if: inputs.action == 'apply'
+        working-directory: .
+        env:
+          AKS_NAME: ${{ steps.out.outputs.aks_name }}
+          AGC_ID: ${{ steps.out.outputs.agc_id }}
+          AGC_FRONTEND_NAME: ${{ steps.out.outputs.agc_frontend_name }}
+          WAF_POLICY_ID: ${{ steps.out.outputs.waf_policy_id }}
+          ALB_CLIENT_ID: ${{ steps.out.outputs.alb_controller_client_id }}
+          ALB_NAMESPACE: ${{ steps.out.outputs.alb_controller_namespace }}
+        run: |
+          set -euo pipefail
+          mkdir -p invoke
+          envsubst '${AGC_ID} ${AGC_FRONTEND_NAME} ${WAF_POLICY_ID}' < k8s/platform/gateway.yaml > invoke/gateway.yaml
+
+          CMD="helm upgrade --install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
+                 --version $ALB_CONTROLLER_VERSION \
+                 --set albController.namespace=$ALB_NAMESPACE \
+                 --set albController.podIdentity.clientID=$ALB_CLIENT_ID \
+                 --wait --timeout 10m \
+            && for i in \$(seq 1 30); do \
+                 kubectl get crd gateways.gateway.networking.k8s.io webapplicationfirewallpolicies.alb.networking.azure.io >/dev/null 2>&1 && break; \
+                 echo 'waiting for Gateway API / ALB CRDs...'; sleep 10; \
+               done \
+            && kubectl apply -f gateway.yaml \
+            && kubectl -n ingress wait gateway/agc-gateway --for=condition=Programmed --timeout=600s \
+            && kubectl -n ingress get gateway agc-gateway -o wide \
+            && kubectl -n ingress get webapplicationfirewallpolicy"
+
+          .github/scripts/aks-invoke.sh "$RG" "$AKS_NAME" "$CMD" invoke/gateway.yaml
+
+      - name: Deploy smoke-test app (HTTPRoute on the Gateway)
         if: inputs.action == 'apply' && inputs.deploy_sample_app
         working-directory: .
         env:
           AKS_NAME: ${{ steps.out.outputs.aks_name }}
-          INGRESS_IP: ${{ steps.out.outputs.ingress_private_ip }}
-          INGRESS_SUBNET: ${{ steps.out.outputs.ingress_subnet_name }}
         run: |
           set -euo pipefail
-          mkdir -p invoke
-          envsubst '${INGRESS_IP} ${INGRESS_SUBNET}' < k8s/sample-app.yaml > invoke/sample-app.yaml
+          .github/scripts/aks-invoke.sh "$RG" "$AKS_NAME" \
+            "kubectl apply -f sample-app.yaml \
+              && kubectl -n sample-app rollout status deploy/hello --timeout=300s \
+              && kubectl -n sample-app get httproute,svc,endpoints,pods -o wide" \
+            k8s/sample-app.yaml
 
-          # 1. pods ready (readiness probe = app answers HTTP)
-          # 2. the internal Service actually received the App Gateway's backend IP
-          KUBECTL="kubectl apply -f sample-app.yaml \
-            && kubectl -n sample-app rollout status deploy/hello --timeout=300s \
-            && kubectl -n sample-app wait svc/hello --timeout=300s \
-                 --for=jsonpath='{.status.loadBalancer.ingress[0].ip}'=$INGRESS_IP \
-            && kubectl -n sample-app get svc,endpoints,pods -o wide"
-
-          # The API server is private; command invoke runs kubectl inside the cluster
-          # through the ARM control plane. Retry while the RBAC assignment propagates.
-          for attempt in 1 2 3 4 5 6; do
-            if result=$(az aks command invoke -g "$RG" -n "$AKS_NAME" \
-                  --command "$KUBECTL" --file invoke/sample-app.yaml -o json); then
-              echo "$result" | jq -r '.logs'
-              [ "$(echo "$result" | jq -r '.exitCode')" = "0" ] && exit 0
-            fi
-            echo "Attempt $attempt failed, retrying in 30s..."
-            sleep 30
-          done
-          echo "::error::Sample app did not become ready, or its Service did not get $INGRESS_IP (see diagnostics below)"
-          exit 1
-
-      - name: Verify traffic flows through the App Gateway WAF
+      - name: Verify traffic flows through the WAF
         if: inputs.action == 'apply' && inputs.deploy_sample_app
         env:
-          AGW_NAME: ${{ steps.out.outputs.app_gateway_name }}
-          AGW_IP: ${{ steps.out.outputs.app_gateway_public_ip }}
+          FQDN: ${{ steps.out.outputs.agc_frontend_fqdn }}
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 10); do
-            server=$(az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" \
-                       --query 'backendAddressPools[0].backendHttpSettingsCollection[0].servers[0]' -o json)
-            health=$(echo "$server" | jq -r '.health')
-            # healthProbeLog is the App Gateway's own explanation (timeout, status code, ...)
-            echo "Backend $(echo "$server" | jq -r '.address'): $health - $(echo "$server" | jq -r '.healthProbeLog // ""')"
-            if [ "$health" = "Healthy" ]; then
-              curl -fsS -o /dev/null -w "HTTP %{http_code} from http://$AGW_IP\n" "http://$AGW_IP/"
+          # Route programming can take a couple of minutes after the HTTPRoute is accepted.
+          for attempt in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -m 10 -w "%{http_code}" "http://$FQDN/" || true)
+            echo "GET http://$FQDN/ -> HTTP $code"
+            if [ "$code" = "200" ]; then
               # The WAF (Prevention mode) must block an obvious attack.
-              code=$(curl -s -o /dev/null -w "%{http_code}" "http://$AGW_IP/?id=1%27%20OR%20%271%27=%271")
+              code=$(curl -s -o /dev/null -m 10 -w "%{http_code}" "http://$FQDN/?id=1%27%20OR%20%271%27=%271" || true)
               echo "SQL-injection probe returned HTTP $code (expected 403 from the WAF)"
               [ "$code" = "403" ] || { echo "::error::WAF did not block the test attack"; exit 1; }
+              echo "## Smoke test passed: http://$FQDN/ (WAF blocks attacks)" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             sleep 30
           done
-          echo "::error::App Gateway backend did not become healthy (see healthProbeLog above and diagnostics below)"
+          echo "::error::http://$FQDN/ did not return 200 (see diagnostics below)"
           exit 1
 
       - name: Diagnostics (on failure)
-        if: failure() && inputs.action == 'apply' && inputs.deploy_sample_app && steps.out.outputs.aks_name != ''
+        if: failure() && inputs.action == 'apply' && steps.out.outputs.aks_name != ''
+        working-directory: .
         env:
           AKS_NAME: ${{ steps.out.outputs.aks_name }}
-          AGW_NAME: ${{ steps.out.outputs.app_gateway_name }}
+          ALB_NAMESPACE: ${{ steps.out.outputs.alb_controller_namespace }}
         run: |
-          echo "::group::Kubernetes: sample-app"
-          az aks command invoke -g "$RG" -n "$AKS_NAME" -o json --command "\
+          AKS_INVOKE_ATTEMPTS=1 .github/scripts/aks-invoke.sh "$RG" "$AKS_NAME" "\
+            kubectl get gateway,httproute -A -o wide; \
+            kubectl -n ingress describe gateway agc-gateway | tail -n 40; \
+            kubectl -n sample-app describe httproute hello | tail -n 30; \
             kubectl -n sample-app get svc,endpoints,pods -o wide; \
-            kubectl -n sample-app describe svc hello; \
-            kubectl -n sample-app describe pods -l app=hello | tail -n 40; \
-            kubectl -n sample-app logs deploy/hello --tail=40; \
-            kubectl -n sample-app get events --sort-by=.lastTimestamp | tail -n 30" \
-            | jq -r '.logs' || true
-          echo "::endgroup::"
-          echo "::group::App Gateway backend health"
-          az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" -o json || true
-          echo "::endgroup::"
+            kubectl -n sample-app logs deploy/hello --tail=30; \
+            kubectl -n $ALB_NAMESPACE get pods -o wide; \
+            kubectl -n $ALB_NAMESPACE logs deploy/alb-controller --tail=60; \
+            kubectl get events -A --sort-by=.lastTimestamp | tail -n 30" || true

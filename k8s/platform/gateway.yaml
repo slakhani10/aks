@@ -1,0 +1,51 @@
+# Platform ingress for App Gateway for Containers (bring-your-own deployment).
+# Applied by the AKS workflow after the ALB Controller is installed. The ${...}
+# placeholders are substituted (envsubst) from Terraform outputs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress
+---
+# The Gateway binds the cluster to the AGfC resource and frontend created by Terraform.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: agc-gateway
+  namespace: ingress
+  annotations:
+    alb.networking.azure.io/alb-id: ${AGC_ID}
+spec:
+  gatewayClassName: azure-alb-external
+  addresses:
+    - type: alb.networking.azure.io/alb-frontend
+      value: ${AGC_FRONTEND_NAME}
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        # Only namespaces explicitly labelled may publish routes on the Internet-facing gateway.
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              agc-routes: allowed
+    # HTTPS: add a listener with port 443, protocol HTTPS and
+    # tls.certificateRefs pointing at a kubernetes.io/tls Secret (for example synced
+    # from the private Key Vault by the Secrets Store CSI driver).
+---
+# WAF step 2 of 2 (step 1 is the Azure SecurityPolicy created by Terraform):
+# applies the WAF policy to EVERY listener and route on the gateway.
+apiVersion: alb.networking.azure.io/v1
+kind: WebApplicationFirewallPolicy
+metadata:
+  name: agc-gateway-waf
+  namespace: ingress
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: agc-gateway
+    namespace: ingress
+  webApplicationFirewall:
+    id: ${WAF_POLICY_ID}

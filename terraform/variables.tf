@@ -57,12 +57,6 @@ variable "grant_deployer_cluster_admin" {
   default     = true
 }
 
-variable "app_gateway_certificate_kv_uri" {
-  description = "Optional Key Vault secret URI (versionless) of a PFX certificate. When set, App Gateway serves HTTPS and redirects HTTP to HTTPS."
-  type        = string
-  default     = null
-}
-
 variable "enable_encryption_at_host" {
   description = "Enable host-based encryption on node VMs. Requires the Microsoft.Compute/EncryptionAtHost feature on the subscription."
   type        = bool
@@ -110,63 +104,32 @@ variable "log_retention_days" {
   }
 }
 
-variable "app_gateway_min_capacity" {
-  description = "App Gateway autoscale minimum instances."
-  type        = number
-  default     = 1
-}
-
-variable "app_gateway_max_capacity" {
-  description = "App Gateway autoscale maximum instances (must fit in the App Gateway subnet)."
-  type        = number
-  default     = 2
-}
-
 # ------------------------------------------------------------ Address space ----
-# Only the four top-level ranges are inputs. Subnets are carved out of the vNet
-# ranges automatically (see locals in network.tf), so they always line up.
-# All four ranges must be IPv4, must not overlap each other, and must not overlap
-# any network you peer or route to. Overlaps are rejected at plan time.
+# Only three top-level ranges are inputs. Subnets are carved out of the vNet range
+# automatically (see locals in network.tf), so they always line up. All ranges must
+# be IPv4, must not overlap each other (or the runner vNet, if connected), and must
+# not overlap any network you peer or route to. Overlaps are rejected at plan time.
 
 variable "aks_vnet_cidr" {
   description = <<-EOT
-    Address space of the AKS vNet. Must be /23 or larger (/16-/23). Carved into:
-      node subnet              /24 (1st /24)  - Azure CNI Overlay: nodes only, 251 nodes
-      internal ingress subnet  /28 (start of the 2nd /24)
-      private endpoint subnet  /28 (next /28)
-    Anything left over (e.g. the other /23 of a /22) is free for growth.
+    Address space of the AKS vNet (the only vNet of the environment). Must be /22 or
+    larger (/16-/22). Carved into:
+      node subnet              1st /24          - Azure CNI Overlay: nodes only, 251 nodes
+      private endpoint subnet  /28 in the 2nd /24 (x.x.1.16/28)
+      AGfC association subnet  3rd /24          - App Gateway for Containers needs exactly /24
+    The rest (e.g. the 4th /24 of a /22) is free for growth.
   EOT
   type        = string
   default     = "10.0.0.0/22"
 
   validation {
-    condition     = can(cidrnetmask(var.aks_vnet_cidr)) && tonumber(split("/", var.aks_vnet_cidr)[1]) >= 16 && tonumber(split("/", var.aks_vnet_cidr)[1]) <= 23
-    error_message = "aks_vnet_cidr must be a valid IPv4 CIDR between /16 and /23 (e.g. 10.0.0.0/22)."
+    condition     = can(cidrnetmask(var.aks_vnet_cidr)) && tonumber(split("/", var.aks_vnet_cidr)[1]) >= 16 && tonumber(split("/", var.aks_vnet_cidr)[1]) <= 22
+    error_message = "aks_vnet_cidr must be a valid IPv4 CIDR between /16 and /22 (e.g. 10.0.0.0/22)."
   }
 
   validation {
     condition     = can(cidrnetmask(var.aks_vnet_cidr)) && cidrsubnet(var.aks_vnet_cidr, 0, 0) == var.aks_vnet_cidr
     error_message = "aks_vnet_cidr must start on its network boundary (e.g. 10.0.0.0/22, not 10.0.1.0/22)."
-  }
-}
-
-variable "agw_vnet_cidr" {
-  description = <<-EOT
-    Address space of the Application Gateway vNet. Must be /25 or larger (/16-/25).
-    The App Gateway subnet is the first /25 (123 usable IPs, well above the max
-    autoscale capacity); anything left over is free.
-  EOT
-  type        = string
-  default     = "10.1.0.0/24"
-
-  validation {
-    condition     = can(cidrnetmask(var.agw_vnet_cidr)) && tonumber(split("/", var.agw_vnet_cidr)[1]) >= 16 && tonumber(split("/", var.agw_vnet_cidr)[1]) <= 25
-    error_message = "agw_vnet_cidr must be a valid IPv4 CIDR between /16 and /25 (e.g. 10.1.0.0/24)."
-  }
-
-  validation {
-    condition     = can(cidrnetmask(var.agw_vnet_cidr)) && cidrsubnet(var.agw_vnet_cidr, 0, 0) == var.agw_vnet_cidr
-    error_message = "agw_vnet_cidr must start on its network boundary (e.g. 10.1.0.0/24)."
   }
 }
 

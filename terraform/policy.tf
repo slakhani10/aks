@@ -10,12 +10,13 @@ locals {
     "azure-arc",
     "azure-extensions-usage-system",
     "aks-command",
+    "azure-alb-system", # ALB Controller for App Gateway for Containers (installed via Helm)
   ]
 }
 
 # Built-in: "Kubernetes clusters should use internal load balancers"
 # Blocks any Service of type LoadBalancer that would get a public IP, so the only
-# Internet entry point stays the Application Gateway WAF.
+# Internet entry point stays App Gateway for Containers with WAF.
 resource "azurerm_resource_group_policy_assignment" "aks_internal_lb" {
   name                 = substr("${local.prefix}-aks-internal-lb", 0, min(64, length("${local.prefix}-aks-internal-lb")))
   display_name         = "${local.prefix}: AKS services must use internal load balancers"

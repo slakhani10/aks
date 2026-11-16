@@ -32,7 +32,6 @@ resource "azurerm_private_dns_zone_virtual_network_link" "kv" {
   for_each = merge(
     {
       aks = { name = azurerm_virtual_network.aks.name, id = azurerm_virtual_network.aks.id }
-      agw = { name = azurerm_virtual_network.agw.name, id = azurerm_virtual_network.agw.id }
     },
     # Lets jobs on the private runner manage secrets/certificates in the private vault.
     local.runner_enabled ? {
@@ -84,14 +83,6 @@ resource "azurerm_monitor_diagnostic_setting" "kv" {
 }
 
 # Least-privilege data-plane access
-resource "azurerm_role_assignment" "kv_agw" {
-  scope                            = azurerm_key_vault.this.id
-  role_definition_name             = "Key Vault Secrets User"
-  principal_id                     = azurerm_user_assigned_identity.agw.principal_id
-  principal_type                   = "ServicePrincipal"
-  skip_service_principal_aad_check = true
-}
-
 resource "azurerm_role_assignment" "kv_csi" {
   scope                            = azurerm_key_vault.this.id
   role_definition_name             = "Key Vault Secrets User"

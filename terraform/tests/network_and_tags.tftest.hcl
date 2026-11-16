@@ -41,23 +41,17 @@ run "default_cidrs" {
   command = plan
 
   assert {
-    condition     = azurerm_virtual_network.aks.address_space == toset(["10.0.0.0/22"]) && azurerm_virtual_network.agw.address_space == toset(["10.1.0.0/24"])
-    error_message = "Unexpected default vNet address spaces."
+    condition     = azurerm_virtual_network.aks.address_space == toset(["10.0.0.0/22"])
+    error_message = "Unexpected default vNet address space."
   }
 
   assert {
     condition = (
       azurerm_subnet.aks["nodes"].address_prefixes[0] == "10.0.0.0/24" &&
-      azurerm_subnet.aks["ingress"].address_prefixes[0] == "10.0.1.0/28" &&
       azurerm_subnet.aks["pe"].address_prefixes[0] == "10.0.1.16/28" &&
-      azurerm_subnet.agw.address_prefixes[0] == "10.1.0.0/25"
+      azurerm_subnet.agc.address_prefixes[0] == "10.0.2.0/24"
     )
     error_message = "Default subnets were not derived as documented."
-  }
-
-  assert {
-    condition     = output.ingress_private_ip == "10.0.1.4"
-    error_message = "Ingress IP should be the first usable Azure address of the ingress subnet."
   }
 
   assert {
@@ -66,12 +60,56 @@ run "default_cidrs" {
   }
 }
 
+run "agc_with_waf" {
+  command = plan
+
+  assert {
+    condition = (
+      azurerm_subnet.agc.delegation[0].service_delegation[0].name == "Microsoft.ServiceNetworking/trafficControllers" &&
+      azurerm_application_load_balancer.this.name == "rg-shop-prod-agc" &&
+      azurerm_application_load_balancer_frontend.this.name == "rg-shop-prod-agc-fe" &&
+      azurerm_application_load_balancer_subnet_association.this.name == "rg-shop-prod-agc-assoc"
+    )
+    error_message = "App Gateway for Containers must be associated with a subnet delegated to trafficControllers."
+  }
+
+  assert {
+    condition = (
+      azurerm_web_application_firewall_policy.this.policy_settings[0].mode == "Prevention" &&
+      azurerm_web_application_firewall_policy.this.policy_settings[0].enabled &&
+      contains([for r in azurerm_web_application_firewall_policy.this.managed_rules[0].managed_rule_set : "${r.type}/${r.version}"], "Microsoft_DefaultRuleSet/2.1")
+    )
+    error_message = "WAF must be enabled in Prevention mode with DRS 2.1 (the rule set AGfC supports)."
+  }
+
+  assert {
+    condition     = azurerm_federated_identity_credential.alb.subject == "system:serviceaccount:azure-alb-system:alb-controller-sa"
+    error_message = "ALB Controller workload identity must be bound to its service account only."
+  }
+
+  assert {
+    condition = (
+      azurerm_role_assignment.alb_config_manager.role_definition_name == "AppGw for Containers Configuration Manager" &&
+      azurerm_role_assignment.alb_subnet_join.role_definition_name == "Network Contributor"
+    )
+    error_message = "ALB Controller must get only the two documented roles."
+  }
+
+  assert {
+    condition = (
+      azurerm_network_security_rule.agc["Allow-Internet-HTTP-HTTPS-Inbound"].destination_port_ranges == toset(["80", "443"]) &&
+      azurerm_network_security_rule.agc["Allow-AzureLoadBalancer-Inbound"].source_address_prefix == "AzureLoadBalancer" &&
+      azurerm_network_security_rule.agc["Deny-All-Inbound"].access == "Deny"
+    )
+    error_message = "AGfC subnet NSG must allow only 80/443 from the Internet plus AzureLoadBalancer."
+  }
+}
+
 run "custom_cidrs" {
   command = plan
 
   variables {
-    aks_vnet_cidr = "192.168.0.0/23"
-    agw_vnet_cidr = "192.168.8.0/25"
+    aks_vnet_cidr = "192.168.0.0/22"
     pod_cidr      = "100.64.0.0/16"
     service_cidr  = "172.20.0.0/20"
   }
@@ -79,26 +117,20 @@ run "custom_cidrs" {
   assert {
     condition = (
       azurerm_subnet.aks["nodes"].address_prefixes[0] == "192.168.0.0/24" &&
-      azurerm_subnet.aks["ingress"].address_prefixes[0] == "192.168.1.0/28" &&
       azurerm_subnet.aks["pe"].address_prefixes[0] == "192.168.1.16/28" &&
-      azurerm_subnet.agw.address_prefixes[0] == "192.168.8.0/25"
+      azurerm_subnet.agc.address_prefixes[0] == "192.168.2.0/24"
     )
-    error_message = "Subnets were not derived from the custom vNet CIDRs."
+    error_message = "Subnets were not derived from the custom vNet CIDR."
   }
 
   assert {
-    condition     = output.ingress_private_ip == "192.168.1.4"
-    error_message = "Ingress IP did not follow the custom AKS vNet CIDR."
-  }
-
-  assert {
-    condition     = flatten([for p in azurerm_application_gateway.this.backend_address_pool : tolist(p.ip_addresses)]) == ["192.168.1.4"]
-    error_message = "App Gateway backend must target the derived ingress IP."
-  }
-
-  assert {
-    condition     = azurerm_network_security_rule.aks["Allow-AppGateway-HTTP-HTTPS-Inbound"].source_address_prefix == "192.168.8.0/25"
-    error_message = "AKS NSG must only allow the derived App Gateway subnet."
+    condition = (
+      azurerm_network_security_rule.aks["Allow-AGC-To-Pods-Inbound"].source_address_prefix == "192.168.2.0/24" &&
+      azurerm_network_security_rule.aks["Allow-AGC-To-Pods-Inbound"].destination_address_prefix == "100.64.0.0/16" &&
+      azurerm_network_security_rule.aks["Deny-AGC-Other-Inbound"].source_address_prefix == "192.168.2.0/24" &&
+      azurerm_network_security_rule.agc["Allow-To-Pods-Outbound"].destination_address_prefix == "100.64.0.0/16"
+    )
+    error_message = "NSGs must follow the derived AGfC subnet and the custom pod range."
   }
 
   assert {
@@ -111,12 +143,11 @@ run "custom_cidrs" {
   }
 }
 
-run "rejects_overlapping_vnets" {
+run "rejects_service_cidr_overlapping_vnet" {
   command = plan
 
   variables {
-    aks_vnet_cidr = "10.0.0.0/22"
-    agw_vnet_cidr = "10.0.2.0/24"
+    service_cidr = "10.0.0.0/16"
   }
 
   expect_failures = [azurerm_virtual_network.aks]
@@ -136,7 +167,7 @@ run "rejects_too_small_aks_vnet" {
   command = plan
 
   variables {
-    aks_vnet_cidr = "10.0.0.0/24"
+    aks_vnet_cidr = "10.0.0.0/23"
   }
 
   expect_failures = [var.aks_vnet_cidr]
@@ -146,10 +177,10 @@ run "rejects_misaligned_cidr" {
   command = plan
 
   variables {
-    agw_vnet_cidr = "10.1.0.5/24"
+    aks_vnet_cidr = "10.0.1.0/22"
   }
 
-  expect_failures = [var.agw_vnet_cidr]
+  expect_failures = [var.aks_vnet_cidr]
 }
 
 run "copies_resource_group_tags" {
@@ -161,7 +192,8 @@ run "copies_resource_group_tags" {
       azurerm_kubernetes_cluster.this.tags == tomap({ costCenter = "1234", env = "prod" }),
       azurerm_kubernetes_cluster.this.default_node_pool[0].tags == tomap({ costCenter = "1234", env = "prod" }),
       azurerm_kubernetes_cluster_node_pool.user.tags == tomap({ costCenter = "1234", env = "prod" }),
-      azurerm_application_gateway.this.tags == tomap({ costCenter = "1234", env = "prod" }),
+      azurerm_application_load_balancer.this.tags == tomap({ costCenter = "1234", env = "prod" }),
+      azurerm_web_application_firewall_policy.this.tags == tomap({ costCenter = "1234", env = "prod" }),
       azurerm_key_vault.this.tags == tomap({ costCenter = "1234", env = "prod" }),
       azurerm_network_security_group.aks.tags == tomap({ costCenter = "1234", env = "prod" }),
     ])

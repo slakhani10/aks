@@ -1,13 +1,13 @@
-# Smoke-test workload exposed ONLY on the AKS internal load balancer.
-# ${INGRESS_IP} and ${INGRESS_SUBNET} are substituted by the workflow (envsubst)
-# with the deployment outputs; App Gateway's backend pool already points at that IP.
-#
-# For real workloads, replace this with an ingress controller (e.g. ingress-nginx or
-# the AKS application routing add-on) whose Service uses the same annotations.
+# Smoke-test workload published through App Gateway for Containers (+ WAF).
+# It is NOT exposed on any load balancer: the HTTPRoute attaches it to the
+# platform Gateway (k8s/platform/gateway.yaml) and AGfC proxies straight to the
+# pods. Use this as the template for real workloads.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: sample-app
+  labels:
+    agc-routes: allowed # lets HTTPRoutes in this namespace attach to the platform Gateway
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -61,18 +61,29 @@ kind: Service
 metadata:
   name: hello
   namespace: sample-app
-  annotations:
-    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "${INGRESS_SUBNET}"
-    service.beta.kubernetes.io/azure-load-balancer-ipv4: "${INGRESS_IP}"
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: hello
   ports:
     - name: http
-      port: 80 # App Gateway backend: ${INGRESS_IP}:80
+      port: 80
       targetPort: http
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hello
+  namespace: sample-app
+spec:
+  parentRefs:
+    - name: agc-gateway
+      namespace: ingress
+      sectionName: http
+  rules:
+    - backendRefs:
+        - name: hello
+          port: 80
 ---
 # Default-deny ingress for the namespace, then allow only HTTP to the app.
 apiVersion: networking.k8s.io/v1
@@ -97,4 +108,4 @@ spec:
   ingress:
     - ports:
         - protocol: TCP
-          port: 8080 # policy applies to the pod port (after the Service maps 80 -> 8080)
+          port: 8080 # App Gateway for Containers connects to the pod port directly
