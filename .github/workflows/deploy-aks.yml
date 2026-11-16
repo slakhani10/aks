@@ -316,19 +316,26 @@ jobs:
           mkdir -p invoke
           envsubst '${INGRESS_IP} ${INGRESS_SUBNET}' < k8s/sample-app.yaml > invoke/sample-app.yaml
 
+          # 1. pods ready (readiness probe = app answers HTTP)
+          # 2. the internal Service actually received the App Gateway's backend IP
+          KUBECTL="kubectl apply -f sample-app.yaml \
+            && kubectl -n sample-app rollout status deploy/hello --timeout=300s \
+            && kubectl -n sample-app wait svc/hello --timeout=300s \
+                 --for=jsonpath='{.status.loadBalancer.ingress[0].ip}'=$INGRESS_IP \
+            && kubectl -n sample-app get svc,endpoints,pods -o wide"
+
           # The API server is private; command invoke runs kubectl inside the cluster
           # through the ARM control plane. Retry while the RBAC assignment propagates.
           for attempt in 1 2 3 4 5 6; do
             if result=$(az aks command invoke -g "$RG" -n "$AKS_NAME" \
-                  --command "kubectl apply -f sample-app.yaml && kubectl -n sample-app rollout status deploy/hello --timeout=180s" \
-                  --file invoke/sample-app.yaml -o json); then
+                  --command "$KUBECTL" --file invoke/sample-app.yaml -o json); then
               echo "$result" | jq -r '.logs'
               [ "$(echo "$result" | jq -r '.exitCode')" = "0" ] && exit 0
             fi
             echo "Attempt $attempt failed, retrying in 30s..."
             sleep 30
           done
-          echo "::error::Sample app deployment failed"
+          echo "::error::Sample app did not become ready, or its Service did not get $INGRESS_IP (see diagnostics below)"
           exit 1
 
       - name: Verify traffic flows through the App Gateway WAF
@@ -337,15 +344,41 @@ jobs:
           AGW_NAME: ${{ steps.out.outputs.app_gateway_name }}
           AGW_IP: ${{ steps.out.outputs.app_gateway_public_ip }}
         run: |
-          for attempt in $(seq 1 20); do
-            health=$(az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" \
-                       --query 'backendAddressPools[0].backendHttpSettingsCollection[0].servers[0].health' -o tsv)
-            echo "Backend health: $health"
+          set -euo pipefail
+          for attempt in $(seq 1 10); do
+            server=$(az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" \
+                       --query 'backendAddressPools[0].backendHttpSettingsCollection[0].servers[0]' -o json)
+            health=$(echo "$server" | jq -r '.health')
+            # healthProbeLog is the App Gateway's own explanation (timeout, status code, ...)
+            echo "Backend $(echo "$server" | jq -r '.address'): $health - $(echo "$server" | jq -r '.healthProbeLog // ""')"
             if [ "$health" = "Healthy" ]; then
               curl -fsS -o /dev/null -w "HTTP %{http_code} from http://$AGW_IP\n" "http://$AGW_IP/"
+              # The WAF (Prevention mode) must block an obvious attack.
+              code=$(curl -s -o /dev/null -w "%{http_code}" "http://$AGW_IP/?id=1%27%20OR%20%271%27=%271")
+              echo "SQL-injection probe returned HTTP $code (expected 403 from the WAF)"
+              [ "$code" = "403" ] || { echo "::error::WAF did not block the test attack"; exit 1; }
               exit 0
             fi
             sleep 30
           done
-          echo "::error::App Gateway backend did not become healthy"
+          echo "::error::App Gateway backend did not become healthy (see healthProbeLog above and diagnostics below)"
           exit 1
+
+      - name: Diagnostics (on failure)
+        if: failure() && inputs.action == 'apply' && inputs.deploy_sample_app && steps.out.outputs.aks_name != ''
+        env:
+          AKS_NAME: ${{ steps.out.outputs.aks_name }}
+          AGW_NAME: ${{ steps.out.outputs.app_gateway_name }}
+        run: |
+          echo "::group::Kubernetes: sample-app"
+          az aks command invoke -g "$RG" -n "$AKS_NAME" -o json --command "\
+            kubectl -n sample-app get svc,endpoints,pods -o wide; \
+            kubectl -n sample-app describe svc hello; \
+            kubectl -n sample-app describe pods -l app=hello | tail -n 40; \
+            kubectl -n sample-app logs deploy/hello --tail=40; \
+            kubectl -n sample-app get events --sort-by=.lastTimestamp | tail -n 30" \
+            | jq -r '.logs' || true
+          echo "::endgroup::"
+          echo "::group::App Gateway backend health"
+          az network application-gateway show-backend-health -g "$RG" -n "$AGW_NAME" -o json || true
+          echo "::endgroup::"

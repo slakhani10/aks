@@ -25,19 +25,29 @@ spec:
         app: hello
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: hello
-          image: mcr.microsoft.com/azuredocs/aks-helloworld:v1
+          # Microsoft's ASP.NET sample: runs as a non-root user and listens on 8080,
+          # so it needs no extra Linux capabilities.
+          image: mcr.microsoft.com/dotnet/samples:aspnetapp
           ports:
-            - containerPort: 80
-          env:
-            - name: TITLE
-              value: "Secure AKS behind Application Gateway WAF"
+            - name: http
+              containerPort: 8080
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-              add: ["NET_BIND_SERVICE"]
+          # Pods only count as ready (and receive traffic) once the app answers HTTP.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
           resources:
             requests:
               cpu: 50m
@@ -61,8 +71,8 @@ spec:
     app: hello
   ports:
     - name: http
-      port: 80
-      targetPort: 80
+      port: 80 # App Gateway backend: ${INGRESS_IP}:80
+      targetPort: http
 ---
 # Default-deny ingress for the namespace, then allow only HTTP to the app.
 apiVersion: networking.k8s.io/v1
@@ -87,4 +97,4 @@ spec:
   ingress:
     - ports:
         - protocol: TCP
-          port: 80
+          port: 8080 # policy applies to the pod port (after the Service maps 80 -> 8080)
