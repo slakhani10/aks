@@ -6,11 +6,12 @@
 #     the AKS vNet (and the private runner vNet when connected).
 #   * Central: set dns_zone_resource_group_name (and dns_zone_subscription_id when
 #     the zones live in another subscription) to use EXISTING zones, e.g. created by
-#     ../dns-zones. Nothing is created or linked here then, except the record
-#     registration and the AKS identity's role on the API zone:
-#       - AKS links its own vNet to the API zone (documented AKS behaviour);
-#       - ../dns-link (workflow "Link private DNS zones") links the AKS vNet to the
-#         Key Vault zone and the runner vNet to both zones.
+#     ../dns-zones. They are looked up by name and linked from here, in the DNS
+#     subscription (provider alias "dns"):
+#       Key Vault zone  <- AKS vNet, runner vNet (if connected)
+#       AKS API zone    <- runner vNet (if connected)
+#     AKS links its own vNet to the API zone (documented AKS behaviour for custom
+#     zones), so that link is not created here - a second one would conflict.
 #
 # A cluster's private DNS zone can't be changed after creation: switching between
 # modes on an existing cluster recreates the cluster.
@@ -102,6 +103,36 @@ resource "azurerm_private_dns_zone_virtual_network_link" "aks_api_runner" {
 
   name                 = "${var.runner_vnet_name}-link"
   private_dns_zone_id  = azurerm_private_dns_zone.aks_api[0].id
+  virtual_network_id   = data.azurerm_virtual_network.runner[0].id
+  registration_enabled = false
+  tags                 = local.tags
+}
+
+# ----------------------------------------------- Links to central zones --
+# Created in the DNS subscription; names carry the vNet name (which includes this
+# environment's resource group) so several environments can share the zones.
+resource "azurerm_private_dns_zone_virtual_network_link" "kv_central" {
+  for_each = local.central_dns ? merge(
+    { aks = { name = azurerm_virtual_network.aks.name, id = azurerm_virtual_network.aks.id } },
+    local.runner_enabled ? {
+      runner = { name = data.azurerm_virtual_network.runner[0].name, id = data.azurerm_virtual_network.runner[0].id }
+    } : {}
+  ) : {}
+  provider = azurerm.dns
+
+  name                 = "${each.value.name}-link"
+  private_dns_zone_id  = data.azurerm_private_dns_zone.kv_central[0].id
+  virtual_network_id   = each.value.id
+  registration_enabled = false
+  tags                 = local.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "aks_api_runner_central" {
+  count    = local.central_dns && local.runner_enabled ? 1 : 0
+  provider = azurerm.dns
+
+  name                 = "${var.runner_vnet_name}-link"
+  private_dns_zone_id  = data.azurerm_private_dns_zone.aks_api_central[0].id
   virtual_network_id   = data.azurerm_virtual_network.runner[0].id
   registration_enabled = false
   tags                 = local.tags

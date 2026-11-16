@@ -1,5 +1,5 @@
 output "dns_zone_subscription_id" {
-  description = "Use as DNS_ZONE_SUBSCRIPTION (repository variable) / dns_subscription (link workflow)."
+  description = "With dns_zone_resource_group_name, the value for the AKS workflow input central_dns_zones (<subscription>/<resource group>)."
   value       = split("/", azurerm_private_dns_zone.this["key_vault"].id)[2]
 }
 

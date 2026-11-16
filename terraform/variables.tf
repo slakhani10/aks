@@ -89,8 +89,9 @@ variable "runner_vnet_name" {
 
 # ------------------------------------------------- Central private DNS zones ---
 # Leave dns_zone_resource_group_name unset to create the zones locally (default).
-# Set it to use EXISTING zones (e.g. created by ../dns-zones) - in another
+# Set it to use and link EXISTING zones (e.g. created by ../dns-zones) - in another
 # subscription when dns_zone_subscription_id is also set. See dns.tf.
+# Workflow input: central_dns_zones = "<subscription name or ID>/<resource group>".
 variable "dns_zone_subscription_id" {
   description = "Subscription ID of the central private DNS zones. Null = this deployment's subscription."
   type        = string

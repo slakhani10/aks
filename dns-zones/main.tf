@@ -5,8 +5,8 @@
 #
 # Created in an EXISTING resource group of the chosen subscription (typically a
 # hub / shared-services subscription). Zones are not linked to any vNet here:
-# the AKS deployment uses them (dns_zone_* variables) and the "Link private DNS
-# zones" workflow (../dns-link) links the environment's vNets.
+# the AKS deployment (workflow input central_dns_zones = "<subscription>/<rg>")
+# uses them and links its own vNets.
 # =============================================================================
 
 data "azurerm_resource_group" "this" {

@@ -4,8 +4,8 @@ name: Deploy central private DNS zones
 # EXISTING resource group of any subscription the workflow identity can access
 # (typically a hub / shared-services subscription):
 #   privatelink.vaultcore.azure.net   and   privatelink.<region>.azmk8s.io
-# Then point the AKS deployment at them (repository variables DNS_ZONE_*) and run
-# "Link private DNS zones" to link the environment's vNets.
+# Then run "Deploy secure AKS environment" with central_dns_zones =
+# "<subscription>/<resource group>": it uses the zones and links its vNets to them.
 
 on:
   workflow_dispatch:
@@ -241,7 +241,6 @@ jobs:
             echo "|---|---|"
             jq -r 'to_entries[] | "| \(.key) | \(.value.value) |"' outputs.json
             echo
-            echo "Next: set repository variables **DNS_ZONE_SUBSCRIPTION** = \`$SUBSCRIPTION\`, **DNS_ZONE_RESOURCE_GROUP** = \`$DNS_RG\`"
-            echo "(and **AKS_PRIVATE_DNS_ZONE_NAME** if the zone region differs from the AKS resource group's region),"
-            echo "deploy AKS, then run **Link private DNS zones**."
+            echo "Next: run **Deploy secure AKS environment** with **central_dns_zones** = \`$SUBSCRIPTION/$DNS_RG\`"
+            echo "(it uses these zones and links the environment's vNets to them)."
           } >> "$GITHUB_STEP_SUMMARY"

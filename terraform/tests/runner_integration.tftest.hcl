@@ -142,7 +142,18 @@ run "central_dns_zones_in_another_subscription" {
       length(azurerm_private_dns_zone_virtual_network_link.aks_api) == 0 &&
       length(azurerm_private_dns_zone_virtual_network_link.aks_api_runner) == 0
     )
-    error_message = "With central zones, no local zones or links may be created (dns-link handles links)."
+    error_message = "With central zones, no LOCAL zones or links may be created."
+  }
+
+  assert {
+    condition = (
+      toset(keys(azurerm_private_dns_zone_virtual_network_link.kv_central)) == toset(["aks", "runner"]) &&
+      azurerm_private_dns_zone_virtual_network_link.kv_central["aks"].name == "rg-shop-prod-vnet-aks-link" &&
+      startswith(azurerm_private_dns_zone_virtual_network_link.kv_central["aks"].private_dns_zone_id, "/subscriptions/99999999-9999-9999-9999-999999999999/") &&
+      length(azurerm_private_dns_zone_virtual_network_link.aks_api_runner_central) == 1 &&
+      startswith(azurerm_private_dns_zone_virtual_network_link.aks_api_runner_central[0].private_dns_zone_id, "/subscriptions/99999999-9999-9999-9999-999999999999/")
+    )
+    error_message = "Central zones must be linked: Key Vault zone <- AKS + runner vNets, API zone <- runner vNet (AKS links its own vNet)."
   }
 
   assert {
@@ -173,4 +184,21 @@ run "rejects_api_zone_for_another_region" {
   }
 
   expect_failures = [data.azurerm_private_dns_zone.aks_api_central]
+}
+
+run "central_dns_without_runner" {
+  command = plan
+
+  variables {
+    dns_zone_subscription_id     = "99999999-9999-9999-9999-999999999999"
+    dns_zone_resource_group_name = "rg-dns-hub"
+  }
+
+  assert {
+    condition = (
+      keys(azurerm_private_dns_zone_virtual_network_link.kv_central) == ["aks"] &&
+      length(azurerm_private_dns_zone_virtual_network_link.aks_api_runner_central) == 0
+    )
+    error_message = "Without a runner only the AKS vNet -> Key Vault zone link is created."
+  }
 }
