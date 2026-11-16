@@ -333,21 +333,34 @@ jobs:
           mkdir -p invoke
           envsubst '${AGC_ID} ${AGC_FRONTEND_NAME} ${WAF_POLICY_ID}' < k8s/platform/gateway.yaml > invoke/gateway.yaml
 
-          CMD="helm upgrade --install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller \
-                 --version $ALB_CONTROLLER_VERSION \
-                 --set albController.namespace=$ALB_NAMESPACE \
-                 --set albController.podIdentity.clientID=$ALB_CLIENT_ID \
-                 --wait --timeout 10m \
-            && for i in \$(seq 1 30); do \
-                 kubectl get crd gateways.gateway.networking.k8s.io webapplicationfirewallpolicies.alb.networking.azure.io >/dev/null 2>&1 && break; \
-                 echo 'waiting for Gateway API / ALB CRDs...'; sleep 10; \
-               done \
-            && kubectl apply -f gateway.yaml \
-            && kubectl -n ingress wait gateway/agc-gateway --for=condition=Programmed --timeout=600s \
-            && kubectl -n ingress get gateway agc-gateway -o wide \
-            && kubectl -n ingress get webapplicationfirewallpolicy"
+          INVOKE=.github/scripts/aks-invoke.sh
+          # Each call is kept to about a minute: command invoke is not meant for long
+          # blocking commands. Waits are short checks that the helper polls.
 
-          .github/scripts/aks-invoke.sh "$RG" "$AKS_NAME" "$CMD" invoke/gateway.yaml
+          echo "::group::1/4 Install or upgrade ALB Controller $ALB_CONTROLLER_VERSION"
+          $INVOKE "$RG" "$AKS_NAME" "helm upgrade --install alb-controller \
+              oci://mcr.microsoft.com/application-lb/charts/alb-controller \
+              --version $ALB_CONTROLLER_VERSION \
+              --set albController.namespace=$ALB_NAMESPACE \
+              --set albController.podIdentity.clientID=$ALB_CLIENT_ID"
+          echo "::endgroup::"
+
+          echo "::group::2/4 Wait for the controller and its CRDs"
+          AKS_INVOKE_ATTEMPTS=20 AKS_INVOKE_DELAY=15 $INVOKE "$RG" "$AKS_NAME" \
+            "kubectl -n $ALB_NAMESPACE rollout status deploy/alb-controller --timeout=45s \
+             && kubectl get crd gateways.gateway.networking.k8s.io webapplicationfirewallpolicies.alb.networking.azure.io"
+          echo "::endgroup::"
+
+          echo "::group::3/4 Apply the platform Gateway and WAF policy"
+          $INVOKE "$RG" "$AKS_NAME" "kubectl apply -f gateway.yaml" invoke/gateway.yaml
+          echo "::endgroup::"
+
+          echo "::group::4/4 Wait until the Gateway is Programmed on App Gateway for Containers"
+          AKS_INVOKE_ATTEMPTS=30 AKS_INVOKE_DELAY=20 $INVOKE "$RG" "$AKS_NAME" \
+            "kubectl -n ingress wait gateway/agc-gateway --for=condition=Programmed --timeout=45s \
+             && kubectl -n ingress get gateway agc-gateway -o wide \
+             && kubectl -n ingress get webapplicationfirewallpolicy"
+          echo "::endgroup::"
 
       - name: Deploy smoke-test app (HTTPRoute on the Gateway)
         if: inputs.action == 'apply' && inputs.deploy_sample_app
@@ -356,11 +369,11 @@ jobs:
           AKS_NAME: ${{ steps.out.outputs.aks_name }}
         run: |
           set -euo pipefail
-          .github/scripts/aks-invoke.sh "$RG" "$AKS_NAME" \
-            "kubectl apply -f sample-app.yaml \
-              && kubectl -n sample-app rollout status deploy/hello --timeout=300s \
-              && kubectl -n sample-app get httproute,svc,endpoints,pods -o wide" \
-            k8s/sample-app.yaml
+          INVOKE=.github/scripts/aks-invoke.sh
+          $INVOKE "$RG" "$AKS_NAME" "kubectl apply -f sample-app.yaml" k8s/sample-app.yaml
+          AKS_INVOKE_ATTEMPTS=12 AKS_INVOKE_DELAY=15 $INVOKE "$RG" "$AKS_NAME" \
+            "kubectl -n sample-app rollout status deploy/hello --timeout=45s \
+             && kubectl -n sample-app get httproute,svc,endpoints,pods -o wide"
 
       - name: Verify traffic flows through the WAF
         if: inputs.action == 'apply' && inputs.deploy_sample_app
