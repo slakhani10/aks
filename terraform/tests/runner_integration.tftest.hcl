@@ -104,6 +104,16 @@ run "runner_connected" {
   }
 
   assert {
+    condition = (
+      azurerm_network_security_rule.aks["Allow-Runner-PostgreSQL-Inbound"].source_address_prefix == "10.2.0.0/26" &&
+      azurerm_network_security_rule.aks["Allow-Runner-PostgreSQL-Inbound"].destination_address_prefix == "10.0.1.16/28" &&
+      azurerm_network_security_rule.aks["Allow-Runner-PostgreSQL-Inbound"].destination_port_range == "5432" &&
+      azurerm_network_security_rule.aks["Allow-Runner-PostgreSQL-Inbound"].priority < azurerm_network_security_rule.aks["Deny-Runner-Other-Inbound"].priority
+    )
+    error_message = "Runner may reach PostgreSQL private endpoints on TCP 5432, in the private endpoint subnet only."
+  }
+
+  assert {
     condition     = azurerm_private_dns_zone_virtual_network_link.aks_api_runner[0].private_dns_zone_id == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-shop-prod/providers/Microsoft.Network/privateDnsZones/privatelink.eastus2.azmk8s.io"
     error_message = "The AKS private API DNS zone must be linked to the runner vNet."
   }
@@ -232,15 +242,21 @@ run "service_zones_can_be_skipped" {
   command = plan
 
   variables {
+    runner_vnet_name               = "rg-shop-prod-vnet-runner"
     postgres_private_dns_zone_name = ""
   }
 
   assert {
     condition = (
       keys(azurerm_private_dns_zone.service) == ["acr"] &&
-      keys(azurerm_private_dns_zone_virtual_network_link.service) == ["acr-aks"]
+      toset(keys(azurerm_private_dns_zone_virtual_network_link.service)) == toset(["acr-aks", "acr-runner"])
     )
     error_message = "An empty zone name must skip that zone and its links."
+  }
+
+  assert {
+    condition     = !contains(keys(azurerm_network_security_rule.aks), "Allow-Runner-PostgreSQL-Inbound")
+    error_message = "No runner PostgreSQL rule when the PostgreSQL zone is skipped."
   }
 }
 

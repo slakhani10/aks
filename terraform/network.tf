@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Networking: one AKS vNet with separate, NSG-protected subnets
 #   * nodes  - AKS node pools (CNI Overlay: pods use pod_cidr, not vNet IPs)
-#   * pe     - private endpoints (Key Vault)
+#   * pe     - private endpoints (Key Vault; ACR / PostgreSQL endpoints you add)
 #   * agc    - Application Gateway for Containers association subnet (/24, delegated)
 #
 # Application Gateway for Containers must share the cluster's vNet: with Azure CNI
@@ -89,9 +89,9 @@ locals {
     }
   }
 
-  runner_inbound_rules = local.runner_enabled ? {
+  runner_inbound_rules = local.runner_enabled ? merge({
     "Allow-Runner-HTTPS-Inbound" = {
-      description                = "Private GitHub runner: TCP 443 only (private AKS API server, Key Vault private endpoint)."
+      description                = "Private GitHub runner: TCP 443 (private AKS API server, Key Vault / ACR private endpoints)."
       priority                   = 120
       direction                  = "Inbound"
       access                     = "Allow"
@@ -110,7 +110,21 @@ locals {
       destination_address_prefix = "*"
       destination_port_ranges    = ["*"]
     }
-  } : {}
+    },
+    # Database jobs on the runner (e.g. migrations) reach PostgreSQL private
+    # endpoints - only in the private endpoint subnet, only on TCP 5432.
+    contains(keys(local.service_dns_zone_names), "postgres") ? {
+      "Allow-Runner-PostgreSQL-Inbound" = {
+        description                = "Private GitHub runner: TCP 5432 to PostgreSQL private endpoints in the private endpoint subnet only."
+        priority                   = 125
+        direction                  = "Inbound"
+        access                     = "Allow"
+        protocol                   = "Tcp"
+        source_address_prefix      = local.runner_vnet_ranges[0]
+        destination_address_prefix = local.aks_pe_subnet_cidr
+        destination_port_ranges    = ["5432"]
+      }
+  } : {}) : {}
 
   aks_outbound_rules = {
     for r in local.egress_rules : r.name => {

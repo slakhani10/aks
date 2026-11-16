@@ -80,8 +80,9 @@ variable "runner_vnet_name" {
     Optional name of the private GitHub runner vNet (created by ../runner, e.g.
     "<rg>-vnet-runner") in the same resource group. When set, the AKS vNet is
     peered with it, the runner may reach the AKS vNet on TCP 443 only (private
-    API server + Key Vault private endpoint), and the private DNS zones of the
-    API server and Key Vault are linked to it. Null = no runner connectivity.
+    API server, Key Vault / ACR private endpoints) plus TCP 5432 to the private
+    endpoint subnet (PostgreSQL private endpoints), and the private DNS zones are
+    linked to it. Null = no runner connectivity.
   EOT
   type        = string
   default     = null
