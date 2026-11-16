@@ -286,6 +286,32 @@ jobs:
             echo "Cluster $AKS_NAME does not exist yet - nothing to migrate"
           fi
 
+      # Remove what runs INSIDE the cluster before Terraform destroys it. Otherwise the
+      # ALB Controller's PodDisruptionBudget can block draining a node pool, and the
+      # controller can't release its App Gateway for Containers configuration.
+      # Short, idempotent commands; skipped if the cluster is already gone.
+      - name: Remove cluster workloads before destroy
+        if: inputs.action == 'destroy'
+        working-directory: .
+        run: |
+          AKS_NAME="$(echo "$RG" | tr '[:upper:]' '[:lower:]')-aks"
+          if ! az aks show -g "$RG" -n "$AKS_NAME" --query id -o tsv >/dev/null 2>&1; then
+            echo "Cluster $AKS_NAME does not exist - nothing to clean up"
+            exit 0
+          fi
+          INVOKE=.github/scripts/aks-invoke.sh
+          AKS_INVOKE_ATTEMPTS=3 $INVOKE "$RG" "$AKS_NAME" \
+            "kubectl delete namespace sample-app --ignore-not-found --wait=false \
+             ; kubectl -n ingress delete gateway agc-gateway --ignore-not-found --timeout=40s \
+             ; kubectl delete namespace ingress --ignore-not-found --wait=false \
+             ; true" || echo "::warning::Could not delete Gateway/sample app"
+          # --no-hooks: the chart's pre-delete cleanup job is for ALB-managed deployments;
+          # here Terraform owns (and is about to delete) the AGfC resources.
+          AKS_INVOKE_ATTEMPTS=3 $INVOKE "$RG" "$AKS_NAME" \
+            "helm uninstall alb-controller --no-hooks --ignore-not-found \
+             ; kubectl -n azure-alb-system delete pdb alb-controller-pdb --ignore-not-found \
+             ; true" || echo "::warning::Could not uninstall the ALB Controller"
+
       - name: terraform apply
         run: terraform apply -no-color tfplan
 
@@ -342,7 +368,9 @@ jobs:
               oci://mcr.microsoft.com/application-lb/charts/alb-controller \
               --version $ALB_CONTROLLER_VERSION \
               --set albController.namespace=$ALB_NAMESPACE \
-              --set albController.podIdentity.clientID=$ALB_CLIENT_ID"
+              --set albController.podIdentity.clientID=$ALB_CLIENT_ID \
+              -f alb-controller-values.yaml" \
+            k8s/platform/alb-controller-values.yaml
           echo "::endgroup::"
 
           # Note: the WAF CRD's plural is singular - webapplicationfirewallpolicy.alb.networking.azure.io

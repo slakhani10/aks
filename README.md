@@ -152,7 +152,8 @@ Workflow: [`.github/workflows/deploy-aks.yml`](.github/workflows/deploy-aks.yml)
   * `action=apply` applies the **exact saved plan** after approval on the `azure-production` environment.
   * `action=destroy` plans and applies a destroy through the same approval gate.
 * State is stored per resource group (`<rg>.tfstate`) in an Azure Storage container, using Entra ID auth and blob-lease locking.
-* Every `apply` installs or updates the **ALB Controller** (Helm chart `alb-controller`, version pinned in `ALB_CONTROLLER_VERSION`). It also applies the **platform Gateway and WAF policy** ([`k8s/platform/gateway.yaml`](k8s/platform/gateway.yaml)) through `az aks command invoke`, because the API server is private.
+* Every `apply` installs or updates the **ALB Controller** (Helm chart `alb-controller`, version pinned in `ALB_CONTROLLER_VERSION`). It runs on the **system node pool** ([`k8s/platform/alb-controller-values.yaml`](k8s/platform/alb-controller-values.yaml)), so its PodDisruptionBudget can never block draining or deleting user nodes. It also applies the **platform Gateway and WAF policy** ([`k8s/platform/gateway.yaml`](k8s/platform/gateway.yaml)) through `az aks command invoke`, because the API server is private.
+* `action=destroy` first removes what runs inside the cluster: the sample app, the Gateway and the ALB Controller. Only then does Terraform delete the Azure resources, so nothing in Kubernetes can block node-pool deletion.
 * `deploy_sample_app=true` deploys [`k8s/sample-app.yaml`](k8s/sample-app.yaml) with an `HTTPRoute`. The workflow then waits until the AGfC frontend returns HTTP 200, and checks that the WAF blocks a SQL-injection probe with HTTP 403. On failure, a diagnostics step prints the Gateway, route, controller and pod state.
 
 ### 1. Create an identity with OIDC federation (no secrets)

@@ -1,0 +1,15 @@
+# Helm values for the App Gateway for Containers ALB Controller (chart alb-controller).
+# The identity (podIdentity.clientID) and namespace are set by the workflow.
+#
+# Run the controller on the SYSTEM node pool: it is platform infrastructure (the chart
+# already gives it priorityClass system-node-critical), and the system pool is
+# tainted CriticalAddonsOnly. Kept off the user pool, its PodDisruptionBudget
+# (minAvailable: 1) can't block draining or deleting user nodes.
+albController:
+  controller:
+    nodeSelector:
+      kubernetes.azure.com/mode: system
+    tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+        effect: NoSchedule
