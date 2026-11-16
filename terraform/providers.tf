@@ -38,3 +38,15 @@ provider "azurerm" {
     }
   }
 }
+
+# Subscription holding CENTRAL private DNS zones (see dns.tf). When
+# dns_zone_subscription_id is null this is the deployment subscription
+# (ARM_SUBSCRIPTION_ID), so the alias is harmless when zones are local.
+provider "azurerm" {
+  alias                           = "dns"
+  subscription_id                 = var.dns_zone_subscription_id == "" ? null : var.dns_zone_subscription_id
+  resource_provider_registrations = "none"
+  storage_use_azuread             = true
+
+  features {}
+}

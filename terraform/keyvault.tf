@@ -22,30 +22,6 @@ resource "azurerm_key_vault" "this" {
   }
 }
 
-resource "azurerm_private_dns_zone" "kv" {
-  name                = "privatelink.vaultcore.azure.net"
-  resource_group_name = local.rg_name
-  tags                = local.tags
-}
-
-resource "azurerm_private_dns_zone_virtual_network_link" "kv" {
-  for_each = merge(
-    {
-      aks = { name = azurerm_virtual_network.aks.name, id = azurerm_virtual_network.aks.id }
-    },
-    # Lets jobs on the private runner manage secrets/certificates in the private vault.
-    local.runner_enabled ? {
-      runner = { name = data.azurerm_virtual_network.runner[0].name, id = data.azurerm_virtual_network.runner[0].id }
-    } : {}
-  )
-
-  name                 = "${each.value.name}-link"
-  private_dns_zone_id  = azurerm_private_dns_zone.kv.id # azurerm 5.x: zone (and its RG) referenced by ID
-  virtual_network_id   = each.value.id
-  registration_enabled = false
-  tags                 = local.tags
-}
-
 resource "azurerm_private_endpoint" "kv" {
   name                          = "${local.prefix}-pe-kv"
   location                      = local.location
@@ -63,7 +39,7 @@ resource "azurerm_private_endpoint" "kv" {
 
   private_dns_zone_group {
     name                 = "default"
-    private_dns_zone_ids = [azurerm_private_dns_zone.kv.id]
+    private_dns_zone_ids = [local.kv_dns_zone_id] # local or central zone (dns.tf)
   }
 }
 

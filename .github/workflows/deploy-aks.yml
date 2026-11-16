@@ -162,6 +162,30 @@ jobs:
           if [ -n "$POD_CIDR" ];     then echo "TF_VAR_pod_cidr=$POD_CIDR"         >> "$GITHUB_ENV"; fi
           if [ -n "$SERVICE_CIDR" ]; then echo "TF_VAR_service_cidr=$SERVICE_CIDR" >> "$GITHUB_ENV"; fi
 
+      # Optional: use CENTRAL private DNS zones (e.g. from "Deploy central private DNS
+      # zones") instead of creating them in this resource group. Repository variables:
+      #   DNS_ZONE_RESOURCE_GROUP (enables it), DNS_ZONE_SUBSCRIPTION (name or ID;
+      #   empty = this subscription), KV_PRIVATE_DNS_ZONE_NAME, AKS_PRIVATE_DNS_ZONE_NAME.
+      # Then run "Link private DNS zones" after this workflow.
+      - name: Central private DNS zones (repository variables)
+        if: vars.DNS_ZONE_RESOURCE_GROUP != ''
+        working-directory: .
+        env:
+          DNS_ZONE_SUBSCRIPTION: ${{ vars.DNS_ZONE_SUBSCRIPTION }}
+          DNS_ZONE_RESOURCE_GROUP: ${{ vars.DNS_ZONE_RESOURCE_GROUP }}
+          KV_ZONE: ${{ vars.KV_PRIVATE_DNS_ZONE_NAME }}
+          AKS_ZONE: ${{ vars.AKS_PRIVATE_DNS_ZONE_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DNS_ZONE_SUBSCRIPTION" ]; then
+            DNS_SUB_ID=$(.github/scripts/resolve-subscription.sh "$DNS_ZONE_SUBSCRIPTION")
+            echo "TF_VAR_dns_zone_subscription_id=$DNS_SUB_ID" >> "$GITHUB_ENV"
+          fi
+          echo "TF_VAR_dns_zone_resource_group_name=$DNS_ZONE_RESOURCE_GROUP" >> "$GITHUB_ENV"
+          if [ -n "$KV_ZONE" ];  then echo "TF_VAR_kv_private_dns_zone_name=$KV_ZONE"   >> "$GITHUB_ENV"; fi
+          if [ -n "$AKS_ZONE" ]; then echo "TF_VAR_aks_private_dns_zone_name=$AKS_ZONE" >> "$GITHUB_ENV"; fi
+          echo "::notice::Using central private DNS zones in '$DNS_ZONE_RESOURCE_GROUP' (${DNS_ZONE_SUBSCRIPTION:-this subscription}). Run 'Link private DNS zones' after this workflow."
+
       - name: Check encryption-at-host feature
         run: |
           # Encryption at host requires a subscription feature flag.

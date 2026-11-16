@@ -1,0 +1,250 @@
+name: Link private DNS zones
+
+# Links an AKS environment's vNets to EXISTING private DNS zones in another
+# (or the same) subscription - e.g. created by "Deploy central private DNS zones".
+# Looks up both zone IDs from subscription + resource group + zone names, then:
+#   Key Vault zone  <- <rg>-vnet-aks, <rg>-vnet-runner (if it exists)
+#   AKS API zone    <- <rg>-vnet-runner (AKS links its own vNet itself)
+# Run it AFTER "Deploy secure AKS environment" (with DNS_ZONE_* repository
+# variables set), so the vNets exist and the cluster already uses the zones.
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Resource group of the AKS environment (holds <rg>-vnet-aks)"
+        required: true
+        type: string
+      dns_subscription:
+        description: "Subscription (name or ID) holding the private DNS zones"
+        required: true
+        type: string
+      dns_resource_group:
+        description: "Resource group holding the private DNS zones"
+        required: true
+        type: string
+      kv_zone_name:
+        description: "Key Vault private DNS zone name"
+        required: true
+        default: "privatelink.vaultcore.azure.net"
+        type: string
+      aks_zone_name:
+        description: "AKS API private DNS zone name (empty = privatelink.<environment region>.azmk8s.io)"
+        required: false
+        default: ""
+        type: string
+      action:
+        description: "plan = preview only, apply = create the links, destroy = remove the links"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+  pull_request:
+    paths:
+      - "dns-link/**"
+      - ".github/workflows/link-dns-zones.yml"
+
+permissions:
+  contents: read
+  id-token: write # OIDC federation to Entra ID - no client secrets stored in GitHub
+
+concurrency:
+  group: dns-link-${{ inputs.resource_group || github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.13.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  WORKDIR: dns-link
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  # Default provider = the AKS environment's subscription; the "dns" provider alias
+  # uses TF_VAR_dns_zone_subscription_id (resolved from the input).
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: fmt & validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: terraform test (offline, mocked provider)
+        run: terraform test
+
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    if: github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    environment: azure-preview
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      RG: ${{ inputs.resource_group }}
+      DNS_SUBSCRIPTION: ${{ inputs.dns_subscription }}
+      TF_VAR_resource_group_name: ${{ inputs.resource_group }}
+      TF_VAR_dns_zone_resource_group_name: ${{ inputs.dns_resource_group }}
+      TF_VAR_kv_private_dns_zone_name: ${{ inputs.kv_zone_name }}
+      TF_VAR_aks_private_dns_zone_name: ${{ inputs.aks_zone_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve DNS subscription and detect vNets
+        working-directory: .
+        run: |
+          set -euo pipefail
+          DNS_SUB_ID=$(.github/scripts/resolve-subscription.sh "$DNS_SUBSCRIPTION")
+          echo "TF_VAR_dns_zone_subscription_id=$DNS_SUB_ID" >> "$GITHUB_ENV"
+
+          PREFIX=$(echo "$RG" | tr '[:upper:]' '[:lower:]')
+          if ! az network vnet show -g "$RG" -n "$PREFIX-vnet-aks" -o none 2>/dev/null; then
+            echo "::error::$PREFIX-vnet-aks not found in '$RG'. Deploy the AKS environment first."
+            exit 1
+          fi
+          if az network vnet show -g "$RG" -n "$PREFIX-vnet-runner" -o none 2>/dev/null; then
+            echo "Private runner vNet found - it will be linked to both zones"
+            echo "TF_VAR_runner_vnet_name=$PREFIX-vnet-runner" >> "$GITHUB_ENV"
+          fi
+          # An empty aks_zone_name input stays empty: Terraform derives
+          # privatelink.<environment region>.azmk8s.io (coalesce skips "").
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RG}-dns-links.tfstate"
+
+      - name: terraform plan
+        run: |
+          DESTROY_FLAG=""
+          if [ "${{ inputs.action }}" = "destroy" ]; then DESTROY_FLAG="-destroy"; fi
+
+          set +e
+          terraform plan $DESTROY_FLAG -out=tfplan -no-color 2>&1 | tee plan.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            rm -f tfplan
+            {
+              echo "## ❌ Terraform plan failed (DNS links for \`$RG\`)"
+              echo '```'
+              grep -A12 -E '^(Error|│ Error)' plan.txt | head -n 80
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::terraform plan failed (exit $PLAN_EXIT). See the errors above or in the run summary."
+            exit "$PLAN_EXIT"
+          fi
+
+          {
+            echo "## Terraform plan (${{ inputs.action }}) - DNS links for \`$RG\`"
+            echo '```'
+            grep -E '^(Plan:|No changes|  # )' plan.txt | tail -n 40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan
+        if: inputs.action != 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-dns-link-${{ github.run_id }}
+          path: ${{ env.WORKDIR }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply
+    if: github.event_name == 'workflow_dispatch' && inputs.action != 'plan'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: azure-production
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+    env:
+      RG: ${{ inputs.resource_group }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dns-link-${{ github.run_id }}
+          path: ${{ env.WORKDIR }}
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RG}-dns-links.tfstate"
+
+      # The saved plan already contains the resolved subscription and zone IDs.
+      - name: terraform apply
+        run: terraform apply -no-color tfplan
+
+      - name: Summary
+        if: inputs.action == 'apply'
+        run: |
+          terraform output -json > outputs.json
+          {
+            echo "## Private DNS zone links for \`$RG\`"
+            echo '```json'
+            jq '{kv_private_dns_zone_id: .kv_private_dns_zone_id.value, aks_private_dns_zone_id: .aks_private_dns_zone_id.value, links: .links.value}' outputs.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -87,6 +87,39 @@ variable "runner_vnet_name" {
   default     = null
 }
 
+# ------------------------------------------------- Central private DNS zones ---
+# Leave dns_zone_resource_group_name unset to create the zones locally (default).
+# Set it to use EXISTING zones (e.g. created by ../dns-zones) - in another
+# subscription when dns_zone_subscription_id is also set. See dns.tf.
+variable "dns_zone_subscription_id" {
+  description = "Subscription ID of the central private DNS zones. Null = this deployment's subscription."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.dns_zone_subscription_id == null || var.dns_zone_subscription_id == "" || can(regex("^[0-9a-fA-F-]{36}$", var.dns_zone_subscription_id))
+    error_message = "dns_zone_subscription_id must be a subscription ID (GUID). The workflow resolves subscription names to IDs."
+  }
+}
+
+variable "dns_zone_resource_group_name" {
+  description = "Resource group of the central private DNS zones. Null/empty = create the zones locally."
+  type        = string
+  default     = null
+}
+
+variable "kv_private_dns_zone_name" {
+  description = "Name of the central Key Vault private DNS zone."
+  type        = string
+  default     = "privatelink.vaultcore.azure.net"
+}
+
+variable "aks_private_dns_zone_name" {
+  description = "Name of the private API server DNS zone. Null = privatelink.<region>.azmk8s.io (must match the cluster's region)."
+  type        = string
+  default     = null
+}
+
 variable "additional_tags" {
   description = "Optional extra tags added to every resource. Resource group tags are always copied and win on key conflicts."
   type        = map(string)

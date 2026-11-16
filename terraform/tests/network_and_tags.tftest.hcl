@@ -24,6 +24,18 @@ mock_provider "azurerm" {
   }
 }
 
+
+# Subscription holding central private DNS zones (provider alias "dns").
+mock_provider "azurerm" {
+  alias = "dns"
+
+  mock_data "azurerm_private_dns_zone" {
+    defaults = {
+      id = "/subscriptions/99999999-9999-9999-9999-999999999999/resourceGroups/rg-dns-hub/providers/Microsoft.Network/privateDnsZones/central-zone"
+    }
+  }
+}
+
 variables {
   resource_group_name = "rg-shop-prod"
 }

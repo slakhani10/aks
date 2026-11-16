@@ -30,6 +30,18 @@ mock_provider "azurerm" {
   }
 }
 
+
+# Subscription holding central private DNS zones (provider alias "dns").
+mock_provider "azurerm" {
+  alias = "dns"
+
+  mock_data "azurerm_private_dns_zone" {
+    defaults = {
+      id = "/subscriptions/99999999-9999-9999-9999-999999999999/resourceGroups/rg-dns-hub/providers/Microsoft.Network/privateDnsZones/central-zone"
+    }
+  }
+}
+
 variables {
   resource_group_name = "rg-shop-prod"
 }
@@ -49,8 +61,8 @@ run "no_runner_by_default" {
   assert {
     condition = (
       azurerm_kubernetes_cluster.this.private_dns_zone_id == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-shop-prod/providers/Microsoft.Network/privateDnsZones/privatelink.eastus2.azmk8s.io" &&
-      azurerm_private_dns_zone.aks_api.name == "privatelink.eastus2.azmk8s.io" &&
-      azurerm_private_dns_zone_virtual_network_link.aks_api.name == "rg-shop-prod-vnet-aks-link"
+      azurerm_private_dns_zone.aks_api[0].name == "privatelink.eastus2.azmk8s.io" &&
+      azurerm_private_dns_zone_virtual_network_link.aks_api[0].name == "rg-shop-prod-vnet-aks-link"
     )
     error_message = "The private API server must use the resource-group-level private DNS zone, linked to the AKS vNet."
   }
@@ -111,4 +123,54 @@ run "rejects_runner_overlapping_aks" {
   }
 
   expect_failures = [azurerm_virtual_network.aks]
+}
+
+run "central_dns_zones_in_another_subscription" {
+  command = plan
+
+  variables {
+    runner_vnet_name             = "rg-shop-prod-vnet-runner"
+    dns_zone_subscription_id     = "99999999-9999-9999-9999-999999999999"
+    dns_zone_resource_group_name = "rg-dns-hub"
+  }
+
+  assert {
+    condition = (
+      length(azurerm_private_dns_zone.kv) == 0 &&
+      length(azurerm_private_dns_zone.aks_api) == 0 &&
+      length(azurerm_private_dns_zone_virtual_network_link.kv) == 0 &&
+      length(azurerm_private_dns_zone_virtual_network_link.aks_api) == 0 &&
+      length(azurerm_private_dns_zone_virtual_network_link.aks_api_runner) == 0
+    )
+    error_message = "With central zones, no local zones or links may be created (dns-link handles links)."
+  }
+
+  assert {
+    condition = (
+      data.azurerm_private_dns_zone.kv_central[0].name == "privatelink.vaultcore.azure.net" &&
+      data.azurerm_private_dns_zone.aks_api_central[0].name == "privatelink.eastus2.azmk8s.io" &&
+      data.azurerm_private_dns_zone.aks_api_central[0].resource_group_name == "rg-dns-hub"
+    )
+    error_message = "Central zones must be looked up by name in the DNS resource group."
+  }
+
+  assert {
+    condition = (
+      startswith(azurerm_kubernetes_cluster.this.private_dns_zone_id, "/subscriptions/99999999-9999-9999-9999-999999999999/") &&
+      startswith(azurerm_role_assignment.aks_private_dns_contributor.scope, "/subscriptions/99999999-9999-9999-9999-999999999999/") &&
+      startswith(tolist(azurerm_private_endpoint.kv.private_dns_zone_group[0].private_dns_zone_ids)[0], "/subscriptions/99999999-9999-9999-9999-999999999999/")
+    )
+    error_message = "Cluster, its DNS role and the Key Vault endpoint must use the central zones."
+  }
+}
+
+run "rejects_api_zone_for_another_region" {
+  command = plan
+
+  variables {
+    dns_zone_resource_group_name = "rg-dns-hub"
+    aks_private_dns_zone_name    = "privatelink.westeurope.azmk8s.io"
+  }
+
+  expect_failures = [data.azurerm_private_dns_zone.aks_api_central]
 }

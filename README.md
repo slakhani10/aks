@@ -292,6 +292,43 @@ Keep `runner` the same on every AKS run. Switching back to `github-hosted` remov
 
 > ⚠️ Self-hosted runners execute workflow code inside your network. Keep this repository **private**, or make sure pull requests from forks can't run on these runners. The workflows here only target the self-hosted runner from manual `workflow_dispatch` runs; pull-request jobs stay on GitHub-hosted runners.
 
+## Central private DNS zones (optional)
+
+By default each environment creates its own `privatelink.vaultcore.azure.net` and `privatelink.<region>.azmk8s.io` zones in its resource group. To use **central zones**, for example in a hub or shared-services subscription, use these two workflows:
+
+| Workflow | Terraform | What it does | Inputs |
+|---|---|---|---|
+| **Deploy central private DNS zones** ([`deploy-dns-zones.yml`](.github/workflows/deploy-dns-zones.yml)) | [`dns-zones/`](dns-zones) | Creates both zones in an **existing** resource group, copying that group's tags | `subscription` (name or ID), `resource_group`, `aks_region` (empty = the RG's region), `action` |
+| **Link private DNS zones** ([`link-dns-zones.yml`](.github/workflows/link-dns-zones.yml)) | [`dns-link/`](dns-link) | Looks up both zone IDs (subscription + resource group + zone names) and links the environment's vNets to them | `resource_group` (AKS environment), `dns_subscription`, `dns_resource_group`, `kv_zone_name`, `aks_zone_name`, `action` |
+
+Links created by **Link private DNS zones**:
+
+| Zone | Linked vNets |
+|---|---|
+| `privatelink.vaultcore.azure.net` | `<rg>-vnet-aks`, `<rg>-vnet-runner` (if it exists) |
+| `privatelink.<region>.azmk8s.io` | `<rg>-vnet-runner` (if it exists). AKS [links its own vNet](https://learn.microsoft.com/azure/aks/private-clusters#hub-and-spoke-with-custom-dns-for-private-aks-clusters) when it uses a custom zone; a second link would conflict. |
+
+**Order**
+1. Run **Deploy central private DNS zones** with `action = apply`.
+2. Set these **repository variables**: `DNS_ZONE_RESOURCE_GROUP` (enables central zones) and `DNS_ZONE_SUBSCRIPTION` (name or ID). If you changed the defaults, also set `KV_PRIVATE_DNS_ZONE_NAME` / `AKS_PRIVATE_DNS_ZONE_NAME`.
+3. (Optional) Run **Deploy private GitHub runner**.
+4. Run **Deploy secure AKS environment**. The cluster now uses the central API zone, and the Key Vault private endpoint registers its record in the central Key Vault zone. No local zones are created.
+5. Run **Link private DNS zones** with `action = apply`.
+
+> ⚠️ A cluster's private DNS zone can't be changed after creation. Switching an **existing** environment between local and central zones recreates the cluster, so destroy it first. To tear down, run **Link private DNS zones** with `action = destroy` *before* destroying the AKS environment.
+
+**Permissions in the DNS subscription** (for the same OIDC app registration):
+
+```bash
+DNS_SCOPE=/subscriptions/<dns-subscription-id>/resourceGroups/<dns-resource-group>
+az role assignment create --assignee "$APP_ID" --role "Private DNS Zone Contributor"            --scope "$DNS_SCOPE"  # zones, links, record registration
+az role assignment create --assignee "$APP_ID" --role "Role Based Access Control Administrator" --scope "$DNS_SCOPE"  # grants the AKS identity "Private DNS Zone Contributor" on the API zone
+az provider register --subscription <dns-subscription-id> -n Microsoft.Network
+az provider register --subscription <dns-subscription-id> -n Microsoft.ContainerService # required in both subscriptions
+```
+
+Subscription names are resolved to IDs with [`.github/scripts/resolve-subscription.sh`](.github/scripts/resolve-subscription.sh). The Terraform state of both workflows stays in the usual state storage account (`dns-zones-<subscription-id>-<rg>.tfstate`, `<rg>-dns-links.tfstate`).
+
 ## Operating the private cluster
 
 ```bash
@@ -350,7 +387,8 @@ terraform/
   network.tf                    # vNets, subnets, NSGs + rules, NAT GW, peering
   aks.tf                        # private AKS cluster, user pool, Container Insights, RBAC
   agc.tf                        # App Gateway for Containers, WAF policy + security policy, ALB Controller identity
-  keyvault.tf                   # Key Vault, private endpoint, private DNS, RBAC
+  keyvault.tf                   # Key Vault, private endpoint, RBAC
+  dns.tf                        # private DNS zones: local (default) or central (other subscription)
   policy.tf                     # Azure Policy assignments (internal LB, pod security)
   flowlogs.tf                   # optional VNet flow logs
   outputs.tf
@@ -365,11 +403,16 @@ runner/                         # separate Terraform root: private GitHub runner
   scripts/register-runner.sh    # run on the VM via az vm run-command
   config/runner-egress-rules.json
   tests/                        # offline `terraform test` suite
+dns-zones/                      # separate Terraform root: central private DNS zones
+dns-link/                       # separate Terraform root: links env vNets to central zones
 k8s/platform/gateway.yaml       # platform Gateway + WebApplicationFirewallPolicy (applied every apply)
 k8s/sample-app.yaml             # smoke-test app (HTTPRoute on the Gateway)
 .github/scripts/aks-invoke.sh   # runs kubectl/helm in the private cluster via az aks command invoke
 .github/workflows/deploy-aks.yml
 .github/workflows/deploy-runner.yml
+.github/workflows/deploy-dns-zones.yml
+.github/workflows/link-dns-zones.yml
+.github/scripts/resolve-subscription.sh
 ```
 
 ## Local usage
