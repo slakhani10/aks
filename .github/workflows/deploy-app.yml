@@ -1,0 +1,348 @@
+name: Deploy application
+
+# Deploys ONE application to an existing secure AKS environment (created by
+# "Deploy secure AKS environment") and publishes it through App Gateway for
+# Containers + WAF. Optionally creates a private PostgreSQL flexible server for it,
+# reachable only through a private endpoint in the environment's PE subnet.
+# Everything is driven by apps/deploy-app.sh - see apps/README.md.
+#
+# Can be started by hand (workflow_dispatch) or from another workflow, e.g. after
+# an image build (workflow_call with secrets: inherit).
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Resource group of the secure AKS environment"
+        required: true
+        type: string
+      service_name:
+        description: "Kubernetes service name (lowercase, max 40 chars) - names the Deployment, route and database too"
+        required: true
+        type: string
+      source:
+        description: "image = deploy a container image from a registry, manifest = apply a YAML manifest from this repo"
+        required: true
+        default: image
+        type: choice
+        options:
+          - image
+          - manifest
+      image:
+        description: "Image <registry>/<repo>:<tag> (e.g. myacr.azurecr.io/shop/api:1.4.2). Manifest mode: optional, replaces ${IMAGE}"
+        required: false
+        default: ""
+        type: string
+      manifest:
+        description: "Manifest mode: path in this repo, e.g. apps/examples/hello-manifest.yaml"
+        required: false
+        default: ""
+        type: string
+      container_port:
+        description: "Port the container listens on"
+        required: true
+        default: "8080"
+        type: string
+      route_path:
+        description: "Public path prefix on the App Gateway for Containers frontend (empty = /<service_name>, '/' = whole site)"
+        required: false
+        default: ""
+        type: string
+      postgres:
+        description: "none, or create = private PostgreSQL flexible server (private endpoint in the PE subnet) + <service>-postgres Secret"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - create
+      settings:
+        description: 'Optional JSON: replicas, namespace, hostname, health_path, service_port, cpu/memory, env, postgres{...} - see apps/README.md'
+        required: false
+        default: "{}"
+        type: string
+      action:
+        description: "deploy, delete-app (keeps any database), delete-app-and-database (DESTROYS the database)"
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - delete-app
+          - delete-app-and-database
+
+  workflow_call:
+    inputs:
+      resource_group: { type: string, required: true }
+      service_name: { type: string, required: true }
+      source: { type: string, required: false, default: image }
+      image: { type: string, required: false, default: "" }
+      manifest: { type: string, required: false, default: "" }
+      container_port: { type: string, required: false, default: "8080" }
+      route_path: { type: string, required: false, default: "" }
+      postgres: { type: string, required: false, default: none }
+      settings: { type: string, required: false, default: "{}" }
+      action: { type: string, required: false, default: deploy }
+    outputs:
+      app_url:
+        description: "Public URL of the application"
+        value: ${{ jobs.deploy.outputs.app_url }}
+
+  pull_request:
+    paths:
+      - "apps/**"
+      - ".github/workflows/deploy-app.yml"
+
+permissions:
+  contents: read
+  id-token: write # OIDC federation to Entra ID - no client secrets stored in GitHub
+
+concurrency:
+  group: app-${{ inputs.resource_group || github.ref }}-${{ inputs.service_name }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.13.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & offline tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: shellcheck
+        run: shellcheck -S warning apps/deploy-app.sh apps/tests/test-render.sh
+
+      - name: Render tests (validation + generated manifests)
+        run: apps/tests/test-render.sh
+
+      - name: PostgreSQL module - fmt, validate, test
+        working-directory: apps/postgres
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+          terraform test
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: ${{ inputs.action }} ${{ inputs.service_name }}
+    if: github.event_name != 'pull_request'
+    needs: lint
+    runs-on: ubuntu-latest
+    environment: azure-production
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      app_url: ${{ steps.verify.outputs.app_url }}
+    env:
+      RESOURCE_GROUP: ${{ inputs.resource_group }}
+      SERVICE_NAME: ${{ inputs.service_name }}
+      SOURCE: ${{ inputs.source }}
+      IMAGE: ${{ inputs.image }}
+      MANIFEST: ${{ inputs.manifest }}
+      CONTAINER_PORT: ${{ inputs.container_port }}
+      ROUTE_PATH: ${{ inputs.route_path }}
+      SETTINGS: ${{ inputs.settings }}
+      OUT_DIR: ${{ github.workspace }}/out/app
+      # Terraform state of the application's database (one per app).
+      PG_STATE_KEY: ${{ inputs.resource_group }}-app-${{ inputs.service_name }}-postgres.tfstate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Validate inputs
+        run: |
+          case "${{ inputs.action }}" in deploy|delete-app|delete-app-and-database) ;; *) echo "::error::action must be deploy, delete-app or delete-app-and-database"; exit 1 ;; esac
+          case "${{ inputs.postgres }}" in none|create) ;; *) echo "::error::postgres must be none or create"; exit 1 ;; esac
+          apps/deploy-app.sh validate
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The environment's Terraform outputs give the AGfC frontend and the
+      # PostgreSQL private DNS zone (local or central).
+      - name: Read the AKS environment
+        id: env
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          if [ "$(az group exists --name "$RESOURCE_GROUP")" != "true" ]; then
+            echo "::error::Resource group '$RESOURCE_GROUP' does not exist."; exit 1
+          fi
+          terraform init -lockfile=readonly -no-color \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${RESOURCE_GROUP}.tfstate" >/dev/null
+          terraform output -json > "$RUNNER_TEMP/aks-outputs.json"
+          AKS_NAME=$(jq -r '.aks_name.value // empty' "$RUNNER_TEMP/aks-outputs.json")
+          if [ -z "$AKS_NAME" ] || ! az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query id -o tsv >/dev/null 2>&1; then
+            echo "::error::No secure AKS environment found in '$RESOURCE_GROUP'. Run 'Deploy secure AKS environment' first."; exit 1
+          fi
+          {
+            echo "aks_name=$AKS_NAME"
+            echo "agc_fqdn=$(jq -r '.agc_frontend_fqdn.value' "$RUNNER_TEMP/aks-outputs.json")"
+            echo "pg_zone_id=$(jq -r '.private_dns_zone_ids.value.postgres // empty' "$RUNNER_TEMP/aks-outputs.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------ database --
+      - name: PostgreSQL - terraform init
+        if: (inputs.action == 'deploy' && inputs.postgres == 'create') || inputs.action == 'delete-app-and-database'
+        working-directory: apps/postgres
+        env:
+          PG_ZONE_ID: ${{ steps.env.outputs.pg_zone_id }}
+          ENTRA_ADMIN_ID: ${{ vars.POSTGRES_ENTRA_ADMIN_GROUP_ID }}
+          ENTRA_ADMIN_NAME: ${{ vars.POSTGRES_ENTRA_ADMIN_GROUP_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PG_ZONE_ID" ]; then
+            if [ "${{ inputs.action }}" = "deploy" ]; then
+              echo "::error::The environment has no PostgreSQL private DNS zone (output private_dns_zone_ids.postgres). Re-run 'Deploy secure AKS environment' with action=apply (and don't set POSTGRES_PRIVATE_DNS_ZONE_NAME=none)."
+              exit 1
+            fi
+            # Destroy only: any well-formed ID satisfies the variable validation.
+            PG_ZONE_ID="/subscriptions/$ARM_SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Network/privateDnsZones/privatelink.postgres.database.azure.com"
+          fi
+          # settings.postgres -> Terraform variables (absent keys keep the defaults).
+          echo "$SETTINGS" | jq -r '(.postgres // {}) as $p | {
+              sku_name: $p.sku_name, postgres_version: ($p.version // null | if . == null then null else tostring end),
+              storage_mb: $p.storage_mb, backup_retention_days: $p.backup_retention_days,
+              geo_redundant_backup_enabled: $p.geo_redundant_backup, database_name: $p.database_name
+            } | with_entries(select(.value != null))' > pg.auto.tfvars.json
+          jq -n --arg rg "$RESOURCE_GROUP" --arg app "$SERVICE_NAME" --arg zone "$PG_ZONE_ID" \
+                --arg aid "$ENTRA_ADMIN_ID" --arg aname "$ENTRA_ADMIN_NAME" '
+            { resource_group_name: $rg, app_name: $app, postgres_private_dns_zone_id: $zone }
+            + (if $aid != "" then { entra_admin_object_id: $aid, entra_admin_principal_name: $aname } else {} end)' \
+            > inputs.auto.tfvars.json
+          echo "Database settings:"; jq . pg.auto.tfvars.json
+          terraform init -no-color \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER || 'tfstate' }}" \
+            -backend-config="key=${PG_STATE_KEY}"
+
+      - name: PostgreSQL - create / update
+        if: inputs.action == 'deploy' && inputs.postgres == 'create'
+        working-directory: apps/postgres
+        run: |
+          set +e
+          terraform plan -out=tfplan -no-color 2>&1 | tee plan.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            echo "::error::terraform plan failed for the database (exit $PLAN_EXIT)"; exit "$PLAN_EXIT"
+          fi
+          {
+            echo "## PostgreSQL for \`$SERVICE_NAME\`"
+            echo '```'; grep -E '^(Plan:|No changes|  # )' plan.txt | tail -n 30; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Server parameters can't be changed in parallel on one server.
+          terraform apply -parallelism=1 -no-color tfplan
+
+      - name: PostgreSQL - connection Secret for the app
+        if: inputs.action == 'deploy' && inputs.postgres == 'create'
+        run: |
+          set -euo pipefail
+          cd apps/postgres
+          PG_PASSWORD=$(terraform output -raw admin_password)
+          echo "::add-mask::$PG_PASSWORD"
+          PG_HOST=$(terraform output -raw fqdn)
+          PG_DATABASE=$(terraform output -raw database_name)
+          PG_USER=$(terraform output -raw admin_login)
+          PG_SERVER=$(terraform output -raw server_name)
+          PG_IP=$(terraform output -raw private_endpoint_ip)
+          cd ../..
+          export PG_PASSWORD PG_HOST PG_DATABASE PG_USER
+          apps/deploy-app.sh postgres-secret
+          {
+            echo "| Database | Value |"
+            echo "|---|---|"
+            echo "| Server | \`$PG_SERVER\` (private endpoint $PG_IP in the PE subnet) |"
+            echo "| Host | \`$PG_HOST\` |"
+            echo "| Database | \`$PG_DATABASE\` |"
+            echo "| Kubernetes Secret | \`${SERVICE_NAME}-postgres\` (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE, DATABASE_URL) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Azure login (refresh after the database deployment)
+        if: inputs.action == 'deploy' && inputs.postgres == 'create'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # --------------------------------------------------------- application --
+      - name: Allow the cluster to pull the image (AcrPull)
+        if: inputs.action == 'deploy'
+        run: apps/deploy-app.sh grant-acr
+
+      - name: Deploy to AKS
+        if: inputs.action == 'deploy'
+        run: |
+          apps/deploy-app.sh apply
+          {
+            echo "## Deployed \`$SERVICE_NAME\`"
+            echo "<details><summary>Applied manifests</summary>"
+            echo
+            for f in "$OUT_DIR"/*.yaml; do echo "\`$(basename "$f")\`"; echo '```yaml'; cat "$f"; echo '```'; done
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for rollout and route
+        if: inputs.action == 'deploy'
+        run: apps/deploy-app.sh wait
+
+      - name: Verify through App Gateway for Containers (WAF)
+        id: verify
+        if: inputs.action == 'deploy'
+        env:
+          AGC_FQDN: ${{ steps.env.outputs.agc_fqdn }}
+        run: |
+          set -euo pipefail
+          apps/deploy-app.sh verify | tee "$RUNNER_TEMP/verify.txt"
+          URL=$(grep '^APP_URL=' "$RUNNER_TEMP/verify.txt" | cut -d= -f2-)
+          echo "app_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "### ✅ $URL (through the WAF; attacks are blocked)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics (on failure)
+        if: failure() && inputs.action == 'deploy' && steps.env.outputs.aks_name != ''
+        run: apps/deploy-app.sh diagnostics
+
+      # -------------------------------------------------------------- delete --
+      - name: Remove the application from AKS
+        if: inputs.action != 'deploy'
+        run: |
+          apps/deploy-app.sh delete
+          echo "## Removed \`$SERVICE_NAME\` from \`$RESOURCE_GROUP\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destroy the PostgreSQL server
+        if: inputs.action == 'delete-app-and-database'
+        working-directory: apps/postgres
+        run: |
+          terraform destroy -auto-approve -parallelism=1 -no-color
+          echo "Database for \`$SERVICE_NAME\` destroyed (state: \`$PG_STATE_KEY\`)." >> "$GITHUB_STEP_SUMMARY"

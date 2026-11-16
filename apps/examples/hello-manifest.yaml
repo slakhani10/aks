@@ -1,0 +1,63 @@
+# Example for source = manifest. Rules (checked by apps/deploy-app.sh):
+#   * no namespace in the objects - the workflow applies them into the app namespace
+#   * a ClusterIP Service whose name = service_name and port = settings.service_port
+#   * no Namespace / cluster-wide objects, no LoadBalancer/NodePort, no privileged pods
+#   * ${IMAGE} is replaced by the workflow's image input (optional)
+# The workflow adds the HTTPRoute, health probe and network policies itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-manifest
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello-manifest
+  template:
+    metadata:
+      labels:
+        app: hello-manifest
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: ${IMAGE}
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: hello-manifest-postgres # created when postgres = create
+                optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-manifest
+spec:
+  type: ClusterIP
+  selector:
+    app: hello-manifest
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

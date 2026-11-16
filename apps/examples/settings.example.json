@@ -1,0 +1,23 @@
+{
+  "namespace": "shop",
+  "replicas": 3,
+  "service_port": 80,
+  "hostname": "orders.contoso.com",
+  "health_path": "/healthz",
+  "strip_path_prefix": true,
+  "cpu_request": "250m",
+  "memory_request": "256Mi",
+  "cpu_limit": "1",
+  "memory_limit": "1Gi",
+  "env": { "ASPNETCORE_ENVIRONMENT": "Production", "FEATURE_X": true },
+  "run_as_non_root": true,
+  "read_only_root_filesystem": true,
+  "postgres": {
+    "sku_name": "GP_Standard_D2ds_v5",
+    "version": "16",
+    "storage_mb": 65536,
+    "backup_retention_days": 14,
+    "geo_redundant_backup": false,
+    "database_name": "orders"
+  }
+}

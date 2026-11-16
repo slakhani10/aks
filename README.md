@@ -352,6 +352,8 @@ For interactive access from inside the network, use the [private GitHub runner](
 
 ## Exposing your applications
 
+> **The easy way:** the **Deploy application** workflow ([`apps/`](apps/README.md)) does all of the following for you, from a container image or your own manifest. It also creates a private PostgreSQL server with a private endpoint when the app needs one. The rest of this section explains what it sets up.
+
 Workloads are published with the Kubernetes **Gateway API**. They don't use load balancers or `Ingress` objects. The platform Gateway `ingress/agc-gateway` is bound to the Terraform-created AGfC resource and frontend, and is WAF-protected. To publish an app:
 
 1. Label its namespace with `agc-routes: allowed`. Only labelled namespaces can attach routes to the Internet-facing Gateway.
@@ -416,12 +418,17 @@ runner/                         # separate Terraform root: private GitHub runner
   config/runner-egress-rules.json
   tests/                        # offline `terraform test` suite
 dns-zones/                      # separate Terraform root: central private DNS zones
+apps/                           # application deployments (own README)
+  deploy-app.sh                 # renders/applies an app + HTTPRoute, health probe, NetworkPolicies
+  postgres/                     # separate Terraform root: per-app PostgreSQL + private endpoint
+  examples/  tests/
 k8s/platform/gateway.yaml       # platform Gateway + WebApplicationFirewallPolicy (applied every apply)
 k8s/sample-app.yaml             # smoke-test app (HTTPRoute on the Gateway)
 .github/scripts/aks-invoke.sh   # runs kubectl/helm in the private cluster via az aks command invoke
 .github/workflows/deploy-aks.yml
 .github/workflows/deploy-runner.yml
 .github/workflows/deploy-dns-zones.yml
+.github/workflows/deploy-app.yml
 .github/scripts/resolve-subscription.sh
 ```
 
