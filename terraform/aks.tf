@@ -178,6 +178,10 @@ resource "azurerm_kubernetes_cluster_node_pool" "user" {
   upgrade_settings {
     max_surge = "33%"
   }
+
+  # Destroy order: delete this pool BEFORE the pipeline loses its Kubernetes access,
+  # so a failed drain can still be fixed by the workflow on the next run.
+  depends_on = [azurerm_role_assignment.aks_deployer]
 }
 
 # ------------------------------------------- Container Insights (managed identity) --

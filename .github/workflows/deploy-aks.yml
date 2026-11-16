@@ -294,23 +294,51 @@ jobs:
         if: inputs.action == 'destroy'
         working-directory: .
         run: |
+          set -euo pipefail
           AKS_NAME="$(echo "$RG" | tr '[:upper:]' '[:lower:]')-aks"
-          if ! az aks show -g "$RG" -n "$AKS_NAME" --query id -o tsv >/dev/null 2>&1; then
+          AKS_ID=$(az aks show -g "$RG" -n "$AKS_NAME" --query id -o tsv 2>/dev/null || true)
+          if [ -z "$AKS_ID" ]; then
             echo "Cluster $AKS_NAME does not exist - nothing to clean up"
             exit 0
           fi
           INVOKE=.github/scripts/aks-invoke.sh
-          AKS_INVOKE_ATTEMPTS=3 $INVOKE "$RG" "$AKS_NAME" \
+
+          # A previous, partially failed destroy can already have removed this pipeline's
+          # Kubernetes access (its "AKS RBAC Cluster Admin" role assignment). Re-grant it
+          # through Azure RBAC (allowed by the RG-scoped RBAC Administrator role); the
+          # cluster and the assignment are deleted by Terraform afterwards anyway.
+          OID=$(az account get-access-token --query accessToken -o tsv | python3 -c '
+          import sys, json, base64
+          p = sys.stdin.read().strip().split(".")[1]
+          p += "=" * (-len(p) % 4)
+          print(json.loads(base64.urlsafe_b64decode(p))["oid"])')
+          if [ -z "$(az role assignment list --assignee "$OID" --scope "$AKS_ID" \
+                       --role "Azure Kubernetes Service RBAC Cluster Admin" --query '[].id' -o tsv)" ]; then
+            echo "Re-granting AKS RBAC Cluster Admin to the pipeline identity for cleanup"
+            az role assignment create --assignee-object-id "$OID" --assignee-principal-type ServicePrincipal \
+              --role "Azure Kubernetes Service RBAC Cluster Admin" --scope "$AKS_ID" -o none
+          fi
+
+          # Retries also cover the time the (re-)granted role takes to propagate.
+          AKS_INVOKE_ATTEMPTS=10 AKS_INVOKE_DELAY=20 $INVOKE "$RG" "$AKS_NAME" \
             "kubectl delete namespace sample-app --ignore-not-found --wait=false \
-             ; kubectl -n ingress delete gateway agc-gateway --ignore-not-found --timeout=40s \
-             ; kubectl delete namespace ingress --ignore-not-found --wait=false \
-             ; true" || echo "::warning::Could not delete Gateway/sample app"
+             && kubectl -n ingress delete gateway agc-gateway --ignore-not-found --timeout=40s \
+             && kubectl delete namespace ingress --ignore-not-found --wait=false"
+
           # --no-hooks: the chart's pre-delete cleanup job is for ALB-managed deployments;
-          # here Terraform owns (and is about to delete) the AGfC resources.
-          AKS_INVOKE_ATTEMPTS=3 $INVOKE "$RG" "$AKS_NAME" \
+          # here Terraform owns (and is about to delete) the AGfC resources. Deleting the
+          # PDB explicitly guarantees nothing can block draining a node pool.
+          AKS_INVOKE_ATTEMPTS=10 AKS_INVOKE_DELAY=20 $INVOKE "$RG" "$AKS_NAME" \
             "helm uninstall alb-controller --no-hooks --ignore-not-found \
-             ; kubectl -n azure-alb-system delete pdb alb-controller-pdb --ignore-not-found \
-             ; true" || echo "::warning::Could not uninstall the ALB Controller"
+             && kubectl -n azure-alb-system delete pdb alb-controller-pdb --ignore-not-found \
+             && kubectl -n azure-alb-system delete deployment alb-controller --ignore-not-found --wait=false"
+
+          # Fail fast (instead of a 30-minute node-pool drain timeout) if anything remains.
+          if ! AKS_INVOKE_ATTEMPTS=6 AKS_INVOKE_DELAY=15 $INVOKE "$RG" "$AKS_NAME" \
+                 "test -z \"\$(kubectl get pdb -A -o name | grep alb-controller)\""; then
+            echo "::error::The ALB Controller PodDisruptionBudget is still present and would block deleting the user node pool. Run: az aks nodepool delete -g $RG --cluster-name $AKS_NAME -n user --ignore-pdb  - then re-run destroy."
+            exit 1
+          fi
 
       - name: terraform apply
         run: terraform apply -no-color tfplan
