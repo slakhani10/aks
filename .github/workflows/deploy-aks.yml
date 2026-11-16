@@ -345,10 +345,13 @@ jobs:
               --set albController.podIdentity.clientID=$ALB_CLIENT_ID"
           echo "::endgroup::"
 
-          echo "::group::2/4 Wait for the controller and its CRDs"
+          # Note: the WAF CRD's plural is singular - webapplicationfirewallpolicy.alb.networking.azure.io
+          echo "::group::2/4 Wait for the controller, its CRDs and the GatewayClass"
           AKS_INVOKE_ATTEMPTS=20 AKS_INVOKE_DELAY=15 $INVOKE "$RG" "$AKS_NAME" \
             "kubectl -n $ALB_NAMESPACE rollout status deploy/alb-controller --timeout=45s \
-             && kubectl get crd gateways.gateway.networking.k8s.io webapplicationfirewallpolicies.alb.networking.azure.io"
+             && kubectl get crd gateways.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io \
+                  webapplicationfirewallpolicy.alb.networking.azure.io \
+             && kubectl get gatewayclass azure-alb-external"
           echo "::endgroup::"
 
           echo "::group::3/4 Apply the platform Gateway and WAF policy"
