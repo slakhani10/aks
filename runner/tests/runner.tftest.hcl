@@ -29,8 +29,8 @@ run "defaults" {
   }
 
   assert {
-    condition     = azurerm_subnet.runner.address_prefixes[0] == "10.2.0.0/28" && azurerm_subnet.runner.default_outbound_access_enabled == false
-    error_message = "Runner subnet must be the first /28 with default outbound access disabled."
+    condition     = azurerm_subnet.runner.address_prefixes[0] == "10.2.0.0/28" && azurerm_subnet.runner.default_outbound_access_enabled == true
+    error_message = "Runner subnet must be the first /28 with default outbound access enabled (no NAT Gateway)."
   }
 
   assert {

@@ -4,8 +4,9 @@
 # Deploys into the EXISTING resource group used by the AKS environment, with the
 # same naming convention (<rg>-...). The runner has:
 #   * no public IP and no inbound access (NSG denies all inbound)
-#   * outbound-only connectivity through a NAT Gateway, filtered by the NSG rules
-#     in config/runner-egress-rules.json
+#   * outbound-only connectivity through Azure's default outbound access (the
+#     subnet is NOT a private subnet; no NAT Gateway, no public IP of its own),
+#     filtered by the NSG rules in config/runner-egress-rules.json
 #   * Trusted Launch (secure boot + vTPM), optional encryption at host,
 #     platform-managed OS patching, SSH password login disabled
 #
@@ -90,29 +91,6 @@ resource "azurerm_network_security_rule" "runner" {
   network_security_group_name = azurerm_network_security_group.runner.name
 }
 
-resource "azurerm_public_ip" "natgw" {
-  name                = "${local.prefix}-pip-natgw-runner"
-  location            = local.location
-  resource_group_name = local.rg_name
-  allocation_method   = "Static"
-  sku                 = "Standard"
-  tags                = local.tags
-}
-
-resource "azurerm_nat_gateway" "runner" {
-  name                    = "${local.prefix}-natgw-runner"
-  location                = local.location
-  resource_group_name     = local.rg_name
-  sku_name                = "Standard"
-  idle_timeout_in_minutes = 4
-  tags                    = local.tags
-}
-
-resource "azurerm_nat_gateway_public_ip_association" "runner" {
-  nat_gateway_id       = azurerm_nat_gateway.runner.id
-  public_ip_address_id = azurerm_public_ip.natgw.id
-}
-
 resource "azurerm_virtual_network" "runner" {
   name                = "${local.prefix}-vnet-runner"
   location            = local.location
@@ -122,21 +100,20 @@ resource "azurerm_virtual_network" "runner" {
 }
 
 resource "azurerm_subnet" "runner" {
-  name                            = "${local.prefix}-snet-runner"
-  resource_group_name             = local.rg_name
-  virtual_network_name            = azurerm_virtual_network.runner.name
-  address_prefixes                = [local.runner_subnet_cidr]
-  default_outbound_access_enabled = false
+  name                 = "${local.prefix}-snet-runner"
+  resource_group_name  = local.rg_name
+  virtual_network_name = azurerm_virtual_network.runner.name
+  address_prefixes     = [local.runner_subnet_cidr]
+  # "Private subnet" unchecked: the VMs reach the Internet through Azure's default
+  # outbound access (a Microsoft-owned IP that can change). Egress is still limited
+  # by the NSG. Existing VMs only pick up a change of this flag after a stop /
+  # deallocate (the runner workflow does that when it switches).
+  default_outbound_access_enabled = true
 }
 
 resource "azurerm_subnet_network_security_group_association" "runner" {
   subnet_id                 = azurerm_subnet.runner.id
   network_security_group_id = azurerm_network_security_group.runner.id
-}
-
-resource "azurerm_subnet_nat_gateway_association" "runner" {
-  subnet_id      = azurerm_subnet.runner.id
-  nat_gateway_id = azurerm_nat_gateway.runner.id
 }
 
 # ---------------------------------------------------------------- Runner VMs --
@@ -214,9 +191,7 @@ resource "azurerm_linux_virtual_machine" "runner" {
   boot_diagnostics {} # managed storage account
 
   depends_on = [
-    azurerm_subnet_nat_gateway_association.runner,
     azurerm_subnet_network_security_group_association.runner,
-    azurerm_nat_gateway_public_ip_association.runner,
   ]
 
   lifecycle {

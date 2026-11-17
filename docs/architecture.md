@@ -254,7 +254,7 @@ flowchart LR
                 VM["S25 #lt;rg#gt;-runner-01 … Ubuntu 24.04<br/>no public IP · Trusted Launch<br/>encryption at host · auto-patching<br/>runner service as unprivileged user"]:::sec
             end
         end
-        NAT["#lt;rg#gt;-natgw-runner<br/>outbound-only static IP"]:::pub
+        NAT["Azure default outbound access<br/>(no NAT Gateway, Microsoft-owned IP)"]:::pub
         subgraph AVNET["vnet-aks 10.0.0.0/22"]
             API["Private AKS API server :443"]:::sec
             PEKV["Key Vault private endpoint :443"]:::sec
@@ -347,6 +347,6 @@ The outbound rules come from [`runner/config/runner-egress-rules.json`](../runne
 | S22 | Network flow logs | Network Watcher | Optional VNet flow logs, 365-day retention, Traffic Analytics; hardened storage account | 6.4 – 6.6 |
 | S23 | Secretless, gated pipeline | GitHub Actions | OIDC federation (no client secrets); RG-scoped roles; saved-plan apply behind required reviewers | 1 IAM (least privilege) |
 | S24 | Consistent tagging | all taggable resources | Resource group tags copied verbatim; AKS propagates them to its node resource group | Governance |
-| S25 | Private self-hosted runner | `runner/` | No public IP, all inbound denied, egress only 443/80 via NAT Gateway; Trusted Launch, encryption at host, platform patching, no password login; no Azure identity on the VM | 6 Networking · 7 Virtual Machines |
+| S25 | Private self-hosted runner | `runner/` | No public IP, all inbound denied, egress only 443/80 via Azure default outbound access (subnet not private, no NAT Gateway); Trusted Launch, encryption at host, platform patching, no password login; no Azure identity on the VM | 6 Networking · 7 Virtual Machines |
 | S26 | Secret-free runner registration | `deploy-runner.yml` | 1-hour GitHub registration token requested per run and passed via `az vm run-command`; never in Terraform state, plan artifacts or the VM model | 1 IAM |
 | S27 | Least-privilege runner reach | AKS NSG + peering | Runner vNet → AKS vNet on TCP 443 (API server, Key Vault / ACR endpoints) and TCP 5432 to the private endpoint subnet only (PostgreSQL endpoints); everything else from the runner vNet denied; private DNS zones linked so names resolve privately | 6 Networking |

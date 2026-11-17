@@ -256,7 +256,7 @@ Then run **Actions → Deploy secure AKS environment → Run workflow**.
 <rg>-vnet-runner 10.2.0.0/26 ──peering (created by the AKS deployment)──► <rg>-vnet-aks
 └─ <rg>-snet-runner 10.2.0.0/28                                          ├─ private API server (443)
    NSG <rg>-nsg-runner: deny ALL inbound                                 └─ Key Vault private endpoint (443)
-   egress: 443/80 to Internet via <rg>-natgw-runner, everything else denied
+   egress: 443/80 to Internet via default outbound access (no NAT Gateway), everything else denied
    <rg>-runner-01 … Ubuntu 24.04, no public IP, Trusted Launch, encryption at host
 ```
 
@@ -270,7 +270,10 @@ Then run **Actions → Deploy secure AKS environment → Run workflow**.
 
 **Security design**
 * No public IP and an NSG that denies all inbound traffic, so nothing on the Internet (or in peered vNets) can connect to the runner. Break-glass access is `az vm run-command invoke` or the serial console; no SSH is exposed.
-* Outbound only through a NAT Gateway, limited by [`runner/config/runner-egress-rules.json`](runner/config/runner-egress-rules.json) to HTTPS (GitHub, Azure, Terraform registry) and HTTP (Ubuntu mirrors). Everything else to the Internet is denied. As with AKS, NSGs can't filter by FQDN; for that, put Azure Firewall in front.
+* Outbound through Azure **default outbound access**: the runner subnet is not a private subnet, and there is no NAT Gateway or public IP of its own. Egress is limited by [`runner/config/runner-egress-rules.json`](runner/config/runner-egress-rules.json) to HTTPS (GitHub, Azure, Terraform registry) and HTTP (Ubuntu mirrors). Everything else to the Internet is denied. As with AKS, NSGs can't filter by FQDN; for that, put Azure Firewall in front.
+  * The source IP is Microsoft-owned and **can change without notice**, so it can't be allow-listed (for example on the Terraform state storage account). Microsoft recommends an explicit outbound method (NAT Gateway, public IP or firewall) for deterministic egress.
+  * Existing runner VMs only switch after a stop/deallocate. The runner workflow does this automatically on the first `apply` after the change: it detects the old NAT Gateway or private subnet, then deallocates and starts the VMs.
+  * The AKS cluster keeps its NAT Gateway (`outboundType: userAssignedNATGateway`). AKS doesn't support default outbound access for nodes: it rejects a `0.0.0.0/0` route to the Internet, and the outbound type `none` requires a network-isolated cluster.
 * Trusted Launch (secure boot + vTPM), encryption at host, platform-managed OS patching, password login disabled, and the runner service runs as an unprivileged `runner` user.
 * The runner VMs have **no Azure identity or roles**. Jobs still sign in to Azure with the same GitHub OIDC credentials as GitHub-hosted runners.
 * **Registration token never stored.** Terraform only stages the runner software (cloud-init). The workflow then asks GitHub for a 1-hour registration token and registers each VM through `az vm run-command`, so the token is never in Terraform state, the plan artifact or the VM model.
@@ -411,7 +414,7 @@ terraform/
   tests/                        # offline `terraform test` suite (mocked provider)
   .terraform.lock.hcl           # pinned provider version (azurerm 5.13.0)
 runner/                         # separate Terraform root: private GitHub runner
-  main.tf                       # runner vNet, NSG, NAT GW, VMs (Trusted Launch)
+  main.tf                       # runner vNet, NSG, VMs (Trusted Launch); egress via default outbound access
   variables.tf  outputs.tf  providers.tf
   cloud-init.yaml.tftpl         # installs Azure CLI + tools, stages the runner
   scripts/register-runner.sh    # run on the VM via az vm run-command

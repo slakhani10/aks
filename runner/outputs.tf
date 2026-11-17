@@ -19,8 +19,3 @@ output "runner_labels" {
   description = "Labels the workflow registers each runner with."
   value       = join(",", local.runner_labels)
 }
-
-output "nat_gateway_public_ip" {
-  description = "Source IP of all runner egress (useful for allow-listing, e.g. on the Terraform state storage account)."
-  value       = azurerm_public_ip.natgw.ip_address
-}

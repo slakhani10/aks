@@ -242,8 +242,42 @@ jobs:
           NAMES=$(terraform output -json runner_vm_names 2>/dev/null || echo '[]')
           echo "names=$(echo "$NAMES" | jq -c .)" >> "$GITHUB_OUTPUT"
 
+      # The subnet's "private subnet" flag (defaultOutboundAccess) only reaches the
+      # NICs of EXISTING VMs after a stop/deallocate. Record it before the apply.
+      - name: Read current runner egress
+        id: egress
+        if: inputs.action == 'apply'
+        run: |
+          PREFIX=$(echo "$RG" | tr '[:upper:]' '[:lower:]')
+          STATE=$(az network vnet subnet show -g "$RG" --vnet-name "${PREFIX}-vnet-runner" -n "${PREFIX}-snet-runner" \
+                    --query "{default: defaultOutboundAccess, nat: natGateway.id}" -o json 2>/dev/null || echo '{}')
+          echo "Runner subnet before apply: $STATE"
+          # Switching from NAT Gateway / private subnet to default outbound access?
+          if echo "$STATE" | jq -e '.nat != null or .default == false' >/dev/null; then
+            echo "switch=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: terraform apply
         run: terraform apply -no-color tfplan
+
+      # Without the NAT Gateway, existing VMs have no Internet egress until they
+      # are deallocated and started again (they then get default outbound access).
+      - name: Restart existing runners onto default outbound access
+        if: inputs.action == 'apply' && steps.egress.outputs.switch == 'true'
+        env:
+          EXISTING: ${{ steps.before.outputs.names }}
+        run: |
+          set -euo pipefail
+          mapfile -t NAMES < <(echo "${EXISTING:-[]}" | jq -r '.[]')
+          if [ "${#NAMES[@]}" -eq 0 ]; then echo "No existing runner VMs"; exit 0; fi
+          for NAME in "${NAMES[@]}"; do
+            if az vm show -g "$RG" -n "$NAME" --query id -o tsv >/dev/null 2>&1; then
+              echo "Deallocating and starting $NAME ..."
+              az vm deallocate -g "$RG" -n "$NAME" -o none
+              az vm start -g "$RG" -n "$NAME" -o none
+            fi
+          done
+          echo "::notice::Runner VMs restarted: their egress now uses Azure default outbound access (no NAT Gateway)."
 
       - name: Register runners with GitHub
         if: inputs.action == 'apply'
