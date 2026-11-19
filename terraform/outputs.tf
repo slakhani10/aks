@@ -63,3 +63,26 @@ output "private_dns_zone_ids" {
     local.service_dns_zone_ids
   )
 }
+
+output "postgres_server_name" {
+  value = local.pg_enabled ? azurerm_postgresql_flexible_server.this[0].name : null
+}
+
+output "postgres_fqdn" {
+  description = "Connect to this name (resolves to the server's private IP in the AKS and runner vNets). TLS required."
+  value       = local.pg_enabled ? azurerm_postgresql_flexible_server.this[0].fqdn : null
+}
+
+output "postgres_admin_login" {
+  value = local.pg_enabled && var.postgres_password_auth_enabled ? "pgadmin" : null
+}
+
+output "postgres_admin_password" {
+  description = "Break-glass password (terraform output -raw postgres_admin_password)."
+  value       = local.pg_enabled && var.postgres_password_auth_enabled ? random_password.pg_admin[0].result : null
+  sensitive   = true
+}
+
+output "postgres_subnet_cidr" {
+  value = local.pg_enabled ? local.pg_subnet_cidr : null
+}

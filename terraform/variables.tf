@@ -210,3 +210,97 @@ variable "service_cidr" {
     error_message = "service_cidr must be a valid IPv4 network CIDR between /12 and /24 (e.g. 172.16.0.0/16)."
   }
 }
+
+# ------------------------------------------- PostgreSQL (VNet integration) ---
+# See postgres.tf. In the workflow these come from repository variables
+# (POSTGRES_ENABLED, POSTGRES_SKU, ...) - see README.
+variable "postgres_enabled" {
+  description = "Create the PostgreSQL 16 flexible server with private access (VNet integration)."
+  type        = bool
+  default     = true
+}
+
+variable "postgres_sku_name" {
+  description = "Compute SKU, e.g. B_Standard_B1ms (burstable, dev/test) or GP_Standard_D2ds_v5 (production)."
+  type        = string
+  default     = "B_Standard_B1ms"
+
+  validation {
+    condition     = can(regex("^(B|GP|MO)_Standard_", var.postgres_sku_name))
+    error_message = "postgres_sku_name must look like B_Standard_B1ms, GP_Standard_D2ds_v5 or MO_Standard_E2ds_v5."
+  }
+}
+
+variable "postgres_storage_mb" {
+  description = "Storage in MB (32768 = 32 GiB). Can only grow; auto-grow is on."
+  type        = number
+  default     = 32768
+
+  validation {
+    condition     = contains([32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4193280, 4194304, 8388608, 16777216, 33553408], var.postgres_storage_mb)
+    error_message = "postgres_storage_mb must be a supported size, e.g. 32768, 65536, 131072."
+  }
+}
+
+variable "postgres_high_availability" {
+  description = "Zone-redundant high availability (standby in another zone). Not available for B_ SKUs."
+  type        = bool
+  default     = false
+}
+
+variable "postgres_backup_retention_days" {
+  description = "Point-in-time restore window (7-35 days)."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.postgres_backup_retention_days >= 7 && var.postgres_backup_retention_days <= 35
+    error_message = "postgres_backup_retention_days must be between 7 and 35."
+  }
+}
+
+variable "postgres_geo_redundant_backup_enabled" {
+  description = "Geo-redundant backups (fixed at creation)."
+  type        = bool
+  default     = false
+}
+
+variable "postgres_databases" {
+  description = "Databases to create on the server."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for d in var.postgres_databases : can(regex("^[a-z_][a-z0-9_]{0,62}$", d))])
+    error_message = "Database names: lowercase letters, digits and _, starting with a letter or _."
+  }
+}
+
+variable "postgres_password_auth_enabled" {
+  description = "Keep a password-based break-glass admin (pgadmin). Turn off once Entra ID logins work."
+  type        = bool
+  default     = true
+}
+
+variable "postgres_entra_admin_object_id" {
+  description = "Entra ID group (recommended) that administers the server. Null = none."
+  type        = string
+  default     = null
+}
+
+variable "postgres_entra_admin_principal_name" {
+  description = "Display name of postgres_entra_admin_object_id."
+  type        = string
+  default     = null
+}
+
+variable "postgres_entra_admin_principal_type" {
+  description = "Group, User or ServicePrincipal."
+  type        = string
+  default     = "Group"
+
+  validation {
+    condition     = contains(["Group", "User", "ServicePrincipal"], var.postgres_entra_admin_principal_type)
+    error_message = "postgres_entra_admin_principal_type must be Group, User or ServicePrincipal."
+  }
+}

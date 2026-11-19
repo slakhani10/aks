@@ -167,6 +167,38 @@ jobs:
           if [ -n "$POD_CIDR" ];     then echo "TF_VAR_pod_cidr=$POD_CIDR"         >> "$GITHUB_ENV"; fi
           if [ -n "$SERVICE_CIDR" ]; then echo "TF_VAR_service_cidr=$SERVICE_CIDR" >> "$GITHUB_ENV"; fi
 
+      # PostgreSQL 16 flexible server with VNet integration (terraform/postgres.tf).
+      # Created by default; repository variables tune or disable it.
+      - name: PostgreSQL settings (repository variables)
+        env:
+          PG_ENABLED: ${{ vars.POSTGRES_ENABLED }}
+          PG_SKU: ${{ vars.POSTGRES_SKU }}
+          PG_STORAGE_MB: ${{ vars.POSTGRES_STORAGE_MB }}
+          PG_HA: ${{ vars.POSTGRES_HA }}
+          PG_BACKUP_DAYS: ${{ vars.POSTGRES_BACKUP_RETENTION_DAYS }}
+          PG_DATABASES: ${{ vars.POSTGRES_DATABASES }}
+          PG_PASSWORD_AUTH: ${{ vars.POSTGRES_PASSWORD_AUTH }}
+          PG_ADMIN_ID: ${{ vars.POSTGRES_ENTRA_ADMIN_GROUP_ID }}
+          PG_ADMIN_NAME: ${{ vars.POSTGRES_ENTRA_ADMIN_GROUP_NAME }}
+        run: |
+          set -euo pipefail
+          {
+            [ -z "$PG_ENABLED" ]       || echo "TF_VAR_postgres_enabled=$PG_ENABLED"
+            [ -z "$PG_SKU" ]           || echo "TF_VAR_postgres_sku_name=$PG_SKU"
+            [ -z "$PG_STORAGE_MB" ]    || echo "TF_VAR_postgres_storage_mb=$PG_STORAGE_MB"
+            [ -z "$PG_HA" ]            || echo "TF_VAR_postgres_high_availability=$PG_HA"
+            [ -z "$PG_BACKUP_DAYS" ]   || echo "TF_VAR_postgres_backup_retention_days=$PG_BACKUP_DAYS"
+            [ -z "$PG_PASSWORD_AUTH" ] || echo "TF_VAR_postgres_password_auth_enabled=$PG_PASSWORD_AUTH"
+            if [ -n "$PG_DATABASES" ]; then
+              # "orders, inventory" -> ["orders","inventory"]
+              echo "TF_VAR_postgres_databases=$(echo "$PG_DATABASES" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')"
+            fi
+            if [ -n "$PG_ADMIN_ID" ]; then
+              echo "TF_VAR_postgres_entra_admin_object_id=$PG_ADMIN_ID"
+              echo "TF_VAR_postgres_entra_admin_principal_name=$PG_ADMIN_NAME"
+            fi
+          } >> "$GITHUB_ENV"
+
       # Private DNS zones for ACR and PostgreSQL private endpoints (created locally
       # or looked up centrally, and linked to the AKS / runner vNets). Defaults:
       # privatelink.azurecr.io and privatelink.postgres.database.azure.com.
@@ -415,7 +447,9 @@ jobs:
             echo "## Deployed \`$RG\`"
             echo "| Output | Value |"
             echo "|---|---|"
-            jq -r 'to_entries[] | "| \(.key) | \(.value.value) |"' outputs.json
+            # Sensitive outputs (e.g. postgres_admin_password) are never printed.
+            jq -r 'to_entries[] | select(.value.sensitive | not) | select(.value.value != null)
+                   | "| \(.key) | \(.value.value | if type == "string" then . else tojson end) |"' outputs.json
           } >> "$GITHUB_STEP_SUMMARY"
 
       # The CLI session from the first login holds a GitHub OIDC client assertion

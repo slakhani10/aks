@@ -46,14 +46,15 @@ Everything else has a secure default in [`terraform/variables.tf`](terraform/var
 |---|---|
 | AKS cluster / node RG | `rg-shop-prod-aks` / `rg-shop-prod-aks-nodes` |
 | vNet | `rg-shop-prod-vnet-aks` |
-| Subnets | `rg-shop-prod-snet-aks-nodes`, `-snet-pe`, `-snet-agc` |
-| NSGs | `rg-shop-prod-nsg-aks`, `rg-shop-prod-nsg-agc` |
+| Subnets | `rg-shop-prod-snet-aks-nodes`, `-snet-pe`, `-snet-agc`, `-snet-pg` |
+| NSGs | `rg-shop-prod-nsg-aks`, `rg-shop-prod-nsg-agc`, `rg-shop-prod-nsg-pg` |
 | App Gateway for Containers / frontend / association | `rg-shop-prod-agc`, `rg-shop-prod-agc-fe`, `rg-shop-prod-agc-assoc` |
 | WAF policy / AGfC security policy | `rg-shop-prod-wafpol`, `rg-shop-prod-agc-waf` |
 | NAT Gateway / PIP | `rg-shop-prod-natgw`, `rg-shop-prod-pip-natgw` |
 | Log Analytics | `rg-shop-prod-log` |
 | Key Vault | `rgshopprodkv<hash>` (alphanumeric + unique suffix: the name must be globally unique and ≤24 chars) |
 | Identities | `rg-shop-prod-id-aks` (control plane), `rg-shop-prod-id-alb` (ALB Controller) |
+| PostgreSQL server / DNS zone | `rg-shop-prod-pg-<hash>`, `rg-shop-prod.private.postgres.database.azure.com` |
 
 ## Network design and sizing
 
@@ -66,8 +67,9 @@ You only pass the vNet range; the subnets are carved out of it automatically, so
 | AKS vNet | `aks_vnet_cidr` | `10.0.0.0/22` | `/22` minimum: it must hold the node `/24` and the AGfC `/24` |
 | Node subnet | 1st `/24` | `10.0.0.0/24` | Azure CNI **Overlay**: pods use `pod_cidr`, so the subnet only holds node IPs (251 nodes) |
 | Private endpoint subnet | `/28` in the 2nd `/24` | `10.0.1.16/28` | Key Vault and future private endpoints |
+| PostgreSQL subnet | 2nd `/27` of the 2nd `/24` | `10.0.1.64/27` | Delegated to `Microsoft.DBforPostgreSQL/flexibleServers` (VNet integration). Can't grow while the server exists; 27 usable IPs (an HA server uses 4) |
 | AGfC association subnet | 3rd `/24` | `10.0.2.0/24` | App Gateway for Containers requires exactly `/24`, delegated to `Microsoft.ServiceNetworking/trafficControllers` |
-| Free | | `10.0.1.0/28`, `10.0.1.32/27`…, `10.0.3.0/24` | Extra node pools or subnets |
+| Free | | `10.0.1.0/28`, `10.0.1.32/27`, `10.0.1.96/27`…, `10.0.3.0/24` | Extra node pools or subnets |
 
 Rules enforced at `terraform plan` time:
 * Each range must be a valid IPv4 network (e.g. `10.0.0.0/22`, not `10.0.1.0/22`) within the allowed sizes.
@@ -129,6 +131,7 @@ Traffic inside the vNet (private endpoints, AGfC, peered runner) and Azure DNS a
 | 8 Other (Key Vault) | Key Vault recoverable | Soft delete (90 days) and purge protection |
 | 8 Other (Key Vault) | RBAC for Key Vault | `enableRbacAuthorization=true`; least-privilege `Key Vault Secrets User` for the CSI driver |
 | 8 Other (Key Vault) | Private endpoints for Key Vault | Public network access disabled; private endpoint and `privatelink.vaultcore.azure.net` linked to both vNets |
+| 4 Database (4.3) | PostgreSQL: SSL enforced, log checkpoints / connections / disconnections, connection throttling, log retention > 3 days, no public access | `require_secure_transport`, `log_checkpoints`, `log_connections`, `log_disconnections`, `connection_throttle.enable` = on, `logfiles.retention_days` = 7; VNet integration with public network access disabled; Entra ID authentication; diagnostics to `<rg>-log` |
 | 8 Other (AKS) | RBAC enabled on AKS | Kubernetes RBAC with Entra ID and **Azure RBAC**, local accounts disabled |
 | 2 Defender for Cloud | Defender for Containers | Defender sensor enabled on the cluster (`securityProfile.defender`); the plan itself is enabled per subscription (see below) |
 
@@ -231,7 +234,7 @@ az role assignment create --assignee "$APP_ID" --role "Key Vault Deleted Vault R
 az feature register --namespace Microsoft.Compute --name EncryptionAtHost
 for ns in Microsoft.ContainerService Microsoft.Network Microsoft.KeyVault Microsoft.OperationalInsights \
           Microsoft.Insights Microsoft.Compute Microsoft.Storage Microsoft.PolicyInsights Microsoft.Security \
-          Microsoft.ServiceNetworking Microsoft.NetworkFunction; do
+          Microsoft.ServiceNetworking Microsoft.NetworkFunction Microsoft.DBforPostgreSQL; do
   az provider register -n $ns
 done
 ```
@@ -295,6 +298,40 @@ Keep `runner` the same on every AKS run. Switching back to `github-hosted` remov
 4. Run **Deploy secure AKS environment** with `runner = self-hosted`.
 
 > ⚠️ Self-hosted runners execute workflow code inside your network. Keep this repository **private**, or make sure pull requests from forks can't run on these runners. The workflows here only target the self-hosted runner from manual `workflow_dispatch` runs; pull-request jobs stay on GitHub-hosted runners.
+
+## PostgreSQL 16 (VNet integration)
+
+Each environment gets an **Azure Database for PostgreSQL flexible server 16** with **private access (VNet integration)**, defined in [`terraform/postgres.tf`](terraform/postgres.tf). It has no public endpoint at all: the server is injected into its own delegated subnet in the AKS vNet.
+
+```
+<rg>-vnet-aks
+├─ <rg>-snet-aks-nodes 10.0.0.0/24 ──TCP 5432──►┐  (pods leave the overlay with their node's IP)
+└─ <rg>-snet-pg 10.0.1.64/27  delegated to Microsoft.DBforPostgreSQL/flexibleServers
+     <rg>-pg-<hash>  PostgreSQL 16 · public network access disabled · TLS required
+     NSG <rg>-nsg-pg   in : 5432 from the node subnet, the subnet itself (HA), the private runner
+                            AzureLoadBalancer · everything else from VirtualNetwork denied
+                       out: 5432 in-subnet · Storage 443 (WAL/backups) · Entra ID 443 · Internet denied
+DNS <rg>.private.postgres.database.azure.com  (linked to the AKS vNet and the runner vNet)
+```
+
+| Setting | Default | Repository variable (workflow) |
+|---|---|---|
+| Create the server | `true` | `POSTGRES_ENABLED` (`false` to skip) |
+| SKU | `B_Standard_B1ms` | `POSTGRES_SKU`, e.g. `GP_Standard_D2ds_v5` for production |
+| Storage | `32768` MB, auto-grow | `POSTGRES_STORAGE_MB` |
+| Zone-redundant HA | `false` | `POSTGRES_HA` (`true`; not on `B_` SKUs) |
+| Backup retention | 7 days | `POSTGRES_BACKUP_RETENTION_DAYS` (7–35) |
+| Databases | none | `POSTGRES_DATABASES`, e.g. `orders, inventory` |
+| Entra ID admin group | none | `POSTGRES_ENTRA_ADMIN_GROUP_ID` + `POSTGRES_ENTRA_ADMIN_GROUP_NAME` (display name) |
+| Password (break-glass) admin `pgadmin` | on | `POSTGRES_PASSWORD_AUTH` (`false` once Entra logins work; then the Entra admin group is required) |
+
+* **Connecting:** use the output `postgres_fqdn` (`<server>.postgres.database.azure.com`). It resolves to the private IP in the AKS and runner vNets. TLS is required (`sslmode=require`).
+* **Authentication:** Entra ID is always on. For workloads, the recommended path is **workload identity + Entra ID tokens**, so no password is involved. The `pgadmin` password is generated once and kept only in the Terraform state. Read it with `terraform output -raw postgres_admin_password`; the workflow never prints it.
+* **Logging:** CIS server parameters (see the CIS table above). Server logs and metrics, and the subnet NSG's events, go to `<rg>-log`.
+* **Backups:** automatic, 7–35 days point-in-time restore. Optionally geo-redundant (`postgres_geo_redundant_backup_enabled`, fixed at creation).
+* **Limits:** a VNet-integrated server can't move to another subnet or vNet, and the subnet can't grow while it exists. Changing `aks_vnet_cidr` therefore recreates the server, **including its data**.
+* **Clients outside the vNet** (on-premises, other spokes): link `<rg>.private.postgres.database.azure.com` to your DNS resolver's vNet, and allow their source ranges on 5432 in `<rg>-nsg-pg`.
+* **Per-application databases:** the [Deploy application](apps/README.md) workflow can still create a separate server per app. Those use a private endpoint in `<rg>-snet-pe` rather than VNet integration.
 
 ## Central private DNS zones (optional)
 
@@ -407,6 +444,7 @@ terraform/
   keyvault.tf                   # Key Vault, private endpoint, RBAC
   dns.tf                        # private DNS zones: local (default) or central zones + links (other subscription)
   policy.tf                     # Azure Policy assignments (internal LB, pod security)
+  postgres.tf                   # PostgreSQL 16 flexible server, VNet integration (delegated subnet, NSG, DNS zone)
   flowlogs.tf                   # optional VNet flow logs
   outputs.tf
   config/aks-egress-rules.json  # editable AKS egress NSG rules

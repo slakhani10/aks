@@ -132,7 +132,12 @@ flowchart TB
             subgraph SNPE["snet-pe 10.0.1.16/28"]
                 PEKV["#lt;rg#gt;-pe-kv<br/>S16 private endpoint"]:::sec
             end
-            FREE["free: 10.0.1.0/28 · 10.0.1.32/27… · 10.0.3.0/24"]:::res
+            subgraph SNPG["snet-pg 10.0.1.64/27"]
+                direction TB
+                NSGPG{{"S28 #lt;rg#gt;-nsg-pg<br/>in: 5432 from nodes, subnet, runner<br/>out: Storage, Entra ID · deny Internet"}}:::nsg
+                PG["S28 #lt;rg#gt;-pg-#lt;hash#gt; · PostgreSQL 16<br/>VNet integration (delegated) · no public access<br/>TLS required · Entra ID auth"]:::sec
+            end
+            FREE["free: 10.0.1.0/28 · 10.0.1.32/27 · 10.0.1.96/27… · 10.0.3.0/24"]:::res
         end
 
         NATGW["#lt;rg#gt;-natgw + pip<br/>S9 outbound-only static IP"]:::pub
@@ -140,7 +145,7 @@ flowchart TB
         subgraph SHARED["Shared services"]
             direction LR
             KV["Key Vault<br/>S16 public access disabled<br/>S17 RBAC · soft delete"]:::sec
-            LAW["#lt;rg#gt;-log · Log Analytics<br/>S20 AKS, AGfC access + WAF, KV, NSG<br/>S22 VNet flow logs (optional)"]:::mon
+            LAW["#lt;rg#gt;-log · Log Analytics<br/>S20 AKS, AGfC access + WAF, KV, NSG, PostgreSQL<br/>S22 VNet flow logs (optional)"]:::mon
         end
 
         POLICY["Azure Policy · RG scope<br/>S11 internal LBs only · S13 pod baseline"]:::sec
@@ -161,6 +166,7 @@ flowchart TB
     POOLS -.-x|"S10 deny"| BLOCKED
     POOLS -.->|"CSI secrets"| PEKV
     PEKV -.-> KV
+    POOLS -->|"S28 TCP 5432 · TLS"| PG
     POLICY -.-> ADDONS
 ```
 
@@ -173,8 +179,9 @@ In the network diagram, subnet and vNet titles omit the `<rg>-` prefix for space
 | `<rg>-vnet-aks` | `10.0.0.0/22` | `aks_vnet_cidr` | the environment's only vNet | |
 | `<rg>-snet-aks-nodes` | `10.0.0.0/24` | 1st `/24` | Node NICs (251 nodes), NAT Gateway attached | `<rg>-nsg-aks` |
 | `<rg>-snet-pe` | `10.0.1.16/28` | `/28` in the 2nd `/24` | Key Vault private endpoint | `<rg>-nsg-aks` |
+| `<rg>-snet-pg` | `10.0.1.64/27` | 2nd `/27` of the 2nd `/24` | PostgreSQL 16 flexible server (VNet integration, delegated) | `<rg>-nsg-pg` |
 | `<rg>-snet-agc` | `10.0.2.0/24` | 3rd `/24` | App Gateway for Containers association (delegated, exactly `/24`) | `<rg>-nsg-agc` |
-| free | `10.0.1.0/28`, `10.0.1.32/27`…, `10.0.3.0/24` | | growth | |
+| free | `10.0.1.0/28`, `10.0.1.32/27`, `10.0.1.96/27`…, `10.0.3.0/24` | | growth | |
 | Pod overlay | `10.244.0.0/16` | `pod_cidr` | Pod IPs; AGfC proxies to these directly | n/a (Cilium policy) |
 | Services | `172.16.0.0/16` | `service_cidr` | ClusterIPs; DNS `172.16.0.10` | n/a |
 
@@ -350,3 +357,4 @@ The outbound rules come from [`runner/config/runner-egress-rules.json`](../runne
 | S25 | Private self-hosted runner | `runner/` | No public IP, all inbound denied, egress only 443/80 via Azure default outbound access (subnet not private, no NAT Gateway); Trusted Launch, encryption at host, platform patching, no password login; no Azure identity on the VM | 6 Networking · 7 Virtual Machines |
 | S26 | Secret-free runner registration | `deploy-runner.yml` | 1-hour GitHub registration token requested per run and passed via `az vm run-command`; never in Terraform state, plan artifacts or the VM model | 1 IAM |
 | S27 | Least-privilege runner reach | AKS NSG + peering | Runner vNet → AKS vNet on TCP 443 (API server, Key Vault / ACR endpoints) and TCP 5432 to the private endpoint subnet only (PostgreSQL endpoints); everything else from the runner vNet denied; private DNS zones linked so names resolve privately | 6 Networking |
+| S28 | Private PostgreSQL 16 | `<rg>-pg-<hash>` in `<rg>-snet-pg` | Flexible server with VNet integration (delegated subnet), public network access disabled; own private DNS zone `<rg>.private.postgres.database.azure.com`; NSG allows 5432 only from the node subnet, the subnet itself and the runner; TLS required, connection/checkpoint logging, connection throttling, log retention 7 days; Entra ID auth; diagnostics to `<rg>-log` | 4 Database Services · 5 Logging |
